@@ -226,7 +226,7 @@ def parse_args():
 
     # Regularization -- smoothness (existing, optional)
     parser.add_argument("--lambda_smooth", type=float, default=0.0,
-                        help="Weight for gate-smoothness regulariser (0 = off)")
+                        help="Weight for gate-smoothness regulariser (0 = off) [RESERVED - NOT CURRENTLY IMPLEMENTED]")
 
     # Regularization -- gate separation (mismatch E)
     parser.add_argument("--lambda_sep", type=float, default=0.0,

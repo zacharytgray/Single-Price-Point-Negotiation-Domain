@@ -322,10 +322,10 @@ def parse_args():
     parser.add_argument("--seller_strategy", type=str, default="linear",
                        help="Seller's strategy (for deterministic agents)")
     parser.add_argument("--buyer_type", type=str, default="deterministic",
-                       choices=["deterministic", "llm", "janus"],
+                       choices=["deterministic", "llm", "janus", "basic", "basic_price", "price_strategy"],
                        help="Type of buyer agent")
     parser.add_argument("--seller_type", type=str, default="deterministic",
-                       choices=["deterministic", "llm", "janus"],
+                       choices=["deterministic", "llm", "janus", "basic", "basic_price", "price_strategy"],
                        help="Type of seller agent")
     
     # Janus configuration

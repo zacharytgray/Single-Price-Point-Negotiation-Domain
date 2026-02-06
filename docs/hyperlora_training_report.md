@@ -374,6 +374,7 @@ for each batch:
 **Purpose:** Ensure nearby $\rho$ values produce smoothly varying gating vectors (prevent erratic jumps in behavior for small $\rho$ changes).
 
 Currently exposed as a CLI argument with default 0.0 (off).
+**Note:** This feature is currently **reserved** and not applied in the training loop.
 
 ---
 

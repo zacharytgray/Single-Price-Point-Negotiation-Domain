@@ -104,20 +104,22 @@ pip install -r requirements.txt
 
 **LLM vs Deterministic:**
 ```bash
-python negotiation.py --agent1 basic --agent2 boulware_linear --rounds 5 --model qwen2:7b
+python negotiation.py --buyer_type basic --seller_strategy boulware_linear --max_turns 5 --model_name qwen2:7b
 ```
 
 **Deterministic vs Deterministic (No LLM):**
 ```bash
-python negotiation.py --agent1 boulware_conceding --agent2 hardliner --rounds 10 --no-llm
+python negotiation.py --buyer_strategy boulware_conceding --seller_strategy hardliner --max_turns 10 --buyer_type deterministic --seller_type deterministic
 ```
 
 ### 3. Generate Training Dataset
 
 ```bash
-python negotiation.py --dataset_mode --num_episodes 10000 --max_turns 20 \
+python negotiation.py --num_runs 10000 --max_turns 20 \
   --dataset_out datasets/price_domain.jsonl
 ```
+
+(Note: Dataset logging is enabled automatically when `--dataset_out` is provided)
 
 ### 4. Prepare Data → Train Janus (HyperLoRA)
 
