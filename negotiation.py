@@ -5,7 +5,7 @@ This module provides the main negotiation loop for running single-issue
 price negotiations between various agent types.
 
 Usage:
-    python negotiation.py --buyer_strategy boulware_conceding --seller_strategy linear
+    python negotiation.py --buyer_strategy boulware_conceding --seller_strategy linear_standard
     python negotiation.py --buyer_type janus --seller_strategy hardliner --janus_adapter checkpoints/final
     python negotiation.py --num_runs 100 --output logs/experiment.csv
 """
@@ -319,7 +319,7 @@ def parse_args():
     # Agent configuration
     parser.add_argument("--buyer_strategy", type=str, default="boulware_conceding",
                        help="Buyer's strategy (for deterministic agents)")
-    parser.add_argument("--seller_strategy", type=str, default="linear",
+    parser.add_argument("--seller_strategy", type=str, default="linear_standard",
                        help="Seller's strategy (for deterministic agents)")
     parser.add_argument("--buyer_type", type=str, default="deterministic",
                        choices=["deterministic", "llm", "janus", "basic", "basic_price", "price_strategy"],
@@ -353,6 +353,8 @@ def parse_args():
                        help="Output CSV file path")
     parser.add_argument("--dataset_out", type=str, default=None,
                        help="Output JSONL file for training data")
+    parser.add_argument("--randomize_strategies", action="store_true",
+                       help="Randomly select strategies for each episode (for dataset generation)")
     parser.add_argument("--quiet", action="store_true",
                        help="Suppress verbose output")
     
@@ -361,6 +363,12 @@ def parse_args():
 
 def main():
     args = parse_args()
+    
+    # Auto-enable randomize_strategies for dataset generation with deterministic agents
+    if args.dataset_out and args.buyer_type == "deterministic" and args.seller_type == "deterministic":
+        if not args.randomize_strategies:
+            print(f"{Fore.YELLOW}Note: Auto-enabling --randomize_strategies for diverse dataset generation{Fore.RESET}")
+            args.randomize_strategies = True
     
     print(f"{Fore.CYAN}{'='*60}")
     print("Single Price Point Negotiation Domain")
@@ -414,12 +422,44 @@ def main():
     results: List[EpisodeResult] = []
     
     print(f"\nRunning {args.num_runs} episodes...")
+    if args.randomize_strategies:
+        print("Using randomized strategies for dataset diversity")
     
     for i in range(args.num_runs):
         episode_id = f"{i:06x}"
+        
+        # Optionally randomize strategies for diversity
+        if args.randomize_strategies:
+            from src.agents.price_strategies import STRATEGY_REGISTRY
+            buyer_strat = random.choice(list(STRATEGY_REGISTRY.keys()))
+            seller_strat = random.choice(list(STRATEGY_REGISTRY.keys()))
+            
+            # Create new agents with random strategies
+            episode_buyer = create_agent(
+                agent_type="deterministic",
+                role="buyer",
+                strategy=buyer_strat,
+                model_name=args.model_name,
+                janus_adapter_path=None,
+                janus_model_path=None,
+                rho=None
+            )
+            episode_seller = create_agent(
+                agent_type="deterministic",
+                role="seller",
+                strategy=seller_strat,
+                model_name=args.model_name,
+                janus_adapter_path=None,
+                janus_model_path=None,
+                rho=None
+            )
+        else:
+            episode_buyer = buyer_agent
+            episode_seller = seller_agent
+        
         result = engine.run_episode(
-            buyer_agent=buyer_agent,
-            seller_agent=seller_agent,
+            buyer_agent=episode_buyer,
+            seller_agent=episode_seller,
             episode_id=episode_id
         )
         results.append(result)

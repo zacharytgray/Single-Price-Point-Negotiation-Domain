@@ -116,10 +116,17 @@ python negotiation.py --buyer_strategy boulware_conceding --seller_strategy hard
 
 ```bash
 python negotiation.py --num_runs 10000 --max_turns 20 \
-  --dataset_out datasets/price_domain.jsonl
+  --dataset_out datasets/price_domain.jsonl \
+  --buyer_type deterministic --seller_type deterministic
 ```
 
-(Note: Dataset logging is enabled automatically when `--dataset_out` is provided)
+**Notes:**
+- **Strategy Diversity:** When using `--dataset_out` with both agents set to `deterministic`, the `--randomize_strategies` flag is **automatically enabled**. This ensures each episode uses a randomly selected strategy pair from the full `STRATEGY_REGISTRY`, creating diverse negotiation outcomes essential for training.
+- **Manual Control:** To use fixed strategies for all episodes, explicitly set `--buyer_strategy` and `--seller_strategy` without the randomization flag.
+- **Expected Output:** ~10,000 episodes generate ~95,000 training examples (avg 9.5 turns/episode) with:
+  - 75% agreement rate (successful negotiations with ρ ∈ [0, 1])
+  - 25% failures (impasse with ρ = -1.0)
+  - Wide rho distribution across the full spectrum
 
 ### 4. Prepare Data → Train Janus (HyperLoRA)
 

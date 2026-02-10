@@ -57,7 +57,7 @@ The model never sees an explicit buyer/seller role token. Instead, $\rho$ alone 
 
 ## 2. HyperLoRA Architecture (Code-Level)
 
-All architecture code lives in [src/training/hyper_lora.py](../src/training/hyper_lora.py) (241 lines, never modified by training-script changes).
+All architecture code lives in [src/training/hyper_lora.py](../src/training/hyper_lora.py).
 
 ### 2.1 `RhoHyperNet` — Hypernetwork
 
