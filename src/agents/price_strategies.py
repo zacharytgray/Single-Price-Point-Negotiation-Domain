@@ -433,6 +433,14 @@ STRATEGY_REGISTRY: Dict[str, StrategySpec] = {
         {"margin": 400.0}
     ),
     
+    # True Hardliner (No Cave-in)
+    "true_hardliner": StrategySpec(
+        "true_hardliner",
+        "Never concedes, never caves in",
+        strategy_hardliner,
+        {"margin": 400.0, "cave_in_margin": 400.0}
+    ),
+    
     # Random Oracle
     "random_zopa": StrategySpec(
         "random_zopa",

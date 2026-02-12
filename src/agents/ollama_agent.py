@@ -2,8 +2,8 @@
 Ollama LLM Agent module for price negotiation.
 """
 
-from langchain.prompts import ChatPromptTemplate
-from langchain.schema import AIMessage, HumanMessage, SystemMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 from colorama import Fore
 from src.utils.thinking_model_processor import strip_thinking_blocks, has_thinking_blocks
