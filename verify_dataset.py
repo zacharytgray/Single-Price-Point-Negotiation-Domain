@@ -47,6 +47,70 @@ def main():
         print(f"  {strat}: {count}")
     print()
 
+    # Strategy ranking by utility gain
+    print("=" * 60)
+    print("STRATEGY RANKING BY UTILITY GAIN")
+    print("=" * 60)
+    print()
+
+    # Calculate utility gain per strategy
+    strategy_utilities = {}
+    strategy_counts = {}
+    
+    for d in data:
+        outcome = d['meta'].get('episode_outcome', {})
+        if not outcome.get('agreement_bool'):
+            continue  # Skip failed negotiations
+        
+        accepted_price = outcome.get('price')
+        if accepted_price is None:
+            continue
+        
+        strategy = d['agent']['strategy']
+        role = d['state']['role']
+        reservation = d['state']['reservation_price']
+        
+        # Calculate utility based on role
+        if role == 'buyer':
+            utility = reservation - accepted_price
+        else:  # seller
+            utility = accepted_price - reservation
+        
+        if strategy not in strategy_utilities:
+            strategy_utilities[strategy] = []
+            strategy_counts[strategy] = {'buyer': 0, 'seller': 0}
+        
+        strategy_utilities[strategy].append(utility)
+        strategy_counts[strategy][role] += 1
+
+    # Rank strategies by average utility
+    ranked_strategies = []
+    for strategy, utilities in strategy_utilities.items():
+        avg_utility = statistics.mean(utilities)
+        median_utility = statistics.median(utilities)
+        std_utility = statistics.stdev(utilities) if len(utilities) > 1 else 0
+        total_episodes = len(utilities)
+        buyer_count = strategy_counts[strategy]['buyer']
+        seller_count = strategy_counts[strategy]['seller']
+        ranked_strategies.append({
+            'strategy': strategy,
+            'avg_utility': avg_utility,
+            'median_utility': median_utility,
+            'std_utility': std_utility,
+            'total_episodes': total_episodes,
+            'buyer_count': buyer_count,
+            'seller_count': seller_count
+        })
+
+    # Sort by average utility (descending)
+    ranked_strategies.sort(key=lambda x: x['avg_utility'], reverse=True)
+
+    print(f"{'Rank':<6} {'Strategy':<35} {'Avg Utility':<12} {'Median':<10} {'Std Dev':<10} {'Episodes':<10} {'Buyer':<7} {'Seller'}")
+    print("-" * 110)
+    for i, s in enumerate(ranked_strategies, 1):
+        print(f"{i:<6} {s['strategy']:<35} {s['avg_utility']:<12.2f} {s['median_utility']:<10.2f} {s['std_utility']:<10.2f} {s['total_episodes']:<10} {s['buyer_count']:<7} {s['seller_count']}")
+    print()
+
     # Rho verification
     print("=" * 60)
     print("RHO VERIFICATION")
