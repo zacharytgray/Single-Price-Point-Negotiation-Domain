@@ -14,23 +14,36 @@ def strategy_boulware(state: PriceState, params: Dict[str, Any]) -> PriceAction:
     """
     Boulware strategy: time-dependent concession curve.
     Target = Start + (Reservation - Start) * (t/T)^beta
+    
+    Starts at opponent's reservation (ZOPA boundary) and concedes toward own reservation.
+    If static_margin is provided, starts at Reservation +/- margin instead.
     """
     beta = params.get("beta", 1.0)
     reservation = state.effective_reservation_price
-
+    
     # Cap time_frac to prevent full capitulation
     concession_cap = params.get("concession_cap", 0.95)
     time_frac = min(concession_cap, state.timestep / state.max_turns)
     
-    margin = params.get("static_margin", 50.0)
+    # Get public price range
+    pub_min, pub_max = state.public_price_range if state.public_price_range else (0.0, 2000.0)
+    
+    # Calculate symmetric starting positions around ZOPA
+    # Buyer at reservation R starts at R - ZOPA_WIDTH (concedes ZOPA_WIDTH units)
+    # Seller at reservation R starts at R + ZOPA_WIDTH (concedes ZOPA_WIDTH units)
+    # This ensures both agents concede the same distance to reach their reservation
+    DEFAULT_ZOPA_WIDTH = 500.0  # Standard ZOPA width from paper
+    margin = params.get("initial_margin", DEFAULT_ZOPA_WIDTH)
     
     if state.role == "buyer":
-        start_price = max(0.0, reservation - margin)
+        # Buyer: Start at reservation - margin, concede UP to own reservation
+        start_price = max(pub_min, reservation - margin)
         target_price = start_price + (reservation - start_price) * (time_frac ** beta)
         target_price = min(target_price, reservation)
         
     else:  # seller
-        start_price = reservation + margin
+        # Seller: Start at reservation + margin, concede DOWN to own reservation
+        start_price = min(pub_max, reservation + margin)
         target_price = start_price + (reservation - start_price) * (time_frac ** beta)
         target_price = max(target_price, reservation)
 
@@ -72,28 +85,36 @@ def strategy_price_fixed(state: PriceState, params: Dict[str, Any]) -> PriceActi
 def strategy_tit_for_tat(state: PriceState, params: Dict[str, Any]) -> PriceAction:
     """
     Tit-for-Tat: Mirror opponent's concession.
-    Start with an extreme offer.
+    Start at opponent's reservation (ZOPA boundary) by default.
     """
     role = state.role
     reservation = state.effective_reservation_price
-    initial_margin = params.get("initial_margin", 50.0)
+    pub_min, pub_max = state.public_price_range if state.public_price_range else (0.0, 2000.0)
+    
+    # Calculate symmetric starting positions around ZOPA
+    # Both agents start ZOPA_WIDTH away from their reservation
+    DEFAULT_ZOPA_WIDTH = 500.0
+    margin = params.get("initial_margin", DEFAULT_ZOPA_WIDTH)
     
     # Initial offer or if no history
     if not state.offer_history:
         if role == "buyer":
-            return PriceAction(type="OFFER", price=round(reservation - initial_margin, 2))
+            start_price = max(pub_min, reservation - margin)
+            return PriceAction(type="OFFER", price=round(start_price, 2))
         else:
-            return PriceAction(type="OFFER", price=round(reservation + initial_margin, 2))
+            start_price = min(pub_max, reservation + margin)
+            return PriceAction(type="OFFER", price=round(start_price, 2))
             
     # Filter history
     my_offers = [p for r, p in state.offer_history if r == role]
     opp_offers = [p for r, p in state.offer_history if r != role]
     
     if not my_offers:
+        # Second turn - use same logic as first turn
         if role == "buyer":
-            target = reservation - initial_margin
+            target = max(pub_min, reservation - margin)
         else:
-            target = reservation + initial_margin
+            target = min(pub_max, reservation + margin)
          
         if state.last_offer_price is not None:
             if role == "buyer" and state.last_offer_price <= target:
@@ -135,13 +156,23 @@ def strategy_linear(state: PriceState, params: Dict[str, Any]) -> PriceAction:
 def strategy_split_difference(state: PriceState, params: Dict[str, Any]) -> PriceAction:
     """
     Split difference between last offer and own previous offer (or reservation).
+    If initial_margin is None, starts at opponent's reservation (ZOPA boundary).
     """
     role = state.role
     reservation = state.effective_reservation_price
+    pub_min, pub_max = state.public_price_range if state.public_price_range else (0.0, 2000.0)
+    
+    # Get ZOPA bounds - default to public bounds if not provided
+    zopa_low = params.get("zopa_low", pub_min)
+    zopa_high = params.get("zopa_high", pub_max)
     
     if state.last_offer_price is None:
-        margin = params.get("initial_margin", 50.0)
-        target = reservation - margin if role == "buyer" else reservation + margin
+        margin = params.get("initial_margin", None)
+        if margin is not None:
+            target = reservation - margin if role == "buyer" else reservation + margin
+        else:
+            # Start at opponent's reservation (ZOPA boundary)
+            target = zopa_low if role == "buyer" else zopa_high
         return PriceAction(type="OFFER", price=round(target, 2))
         
     opp_price = state.last_offer_price
@@ -169,10 +200,15 @@ def strategy_split_difference(state: PriceState, params: Dict[str, Any]) -> Pric
 def strategy_time_dependent_threshold(state: PriceState, params: Dict[str, Any]) -> PriceAction:
     """
     Accepts only if offer improves. Threshold relaxes as deadline approaches.
+    Starts symmetrically around ZOPA (ZOPA_WIDTH away from reservation).
     """
     reservation = state.effective_reservation_price
     role = state.role
-    margin = params.get("margin", 20.0)
+    pub_min, pub_max = state.public_price_range if state.public_price_range else (0.0, 2000.0)
+    
+    # Calculate symmetric starting positions around ZOPA
+    DEFAULT_ZOPA_WIDTH = 500.0
+    margin = params.get("margin", DEFAULT_ZOPA_WIDTH)
     
     t = state.timestep
     T = state.max_turns
@@ -181,13 +217,19 @@ def strategy_time_dependent_threshold(state: PriceState, params: Dict[str, Any])
     frac = min(concession_cap, t / T)
     
     if role == "buyer":
-        current_threshold = (reservation - margin) + (margin * frac)
+        # Start at reservation - margin, concede to reservation
+        start_price = max(pub_min, reservation - margin)
+            
+        current_threshold = start_price + (reservation - start_price) * frac
         target = min(current_threshold, reservation)
         
         if state.last_offer_price is not None and state.last_offer_price <= target:
             return PriceAction(type="ACCEPT", price=None)
     else:
-        current_threshold = (reservation + margin) - (margin * frac)
+        # Start at reservation + margin, concede to reservation
+        start_price = min(pub_max, reservation + margin)
+            
+        current_threshold = start_price - (start_price - reservation) * frac
         target = max(current_threshold, reservation)
         
         if state.last_offer_price is not None and state.last_offer_price >= target:
@@ -199,22 +241,31 @@ def strategy_time_dependent_threshold(state: PriceState, params: Dict[str, Any])
 def strategy_hardliner(state: PriceState, params: Dict[str, Any]) -> PriceAction:
     """
     Maintains a tough stance until the very last round, then concedes to reservation.
+    If margin is None, holds at opponent's reservation (ZOPA boundary).
     """
     reservation = state.effective_reservation_price
     role = state.role
-    margin = params.get("margin", 30.0)
+    pub_min, pub_max = state.public_price_range if state.public_price_range else (0.0, 2000.0)
     
+    # Calculate symmetric hold positions around ZOPA
+    DEFAULT_ZOPA_WIDTH = 500.0
+    margin = params.get("margin", DEFAULT_ZOPA_WIDTH)
+    
+    # Determine hold position (symmetric around ZOPA)
+    if role == "buyer":
+        hold_price = max(pub_min, reservation - margin)
+    else:
+        hold_price = min(pub_max, reservation + margin)
+    
+    # Check if we should cave in (Last Round)
     if state.timestep >= state.max_turns - 1:
         cave_in_margin = params.get("cave_in_margin", 5.0)
         if role == "buyer":
-            target = reservation - cave_in_margin
+            target = max(pub_min, reservation - cave_in_margin)
         else:
-            target = reservation + cave_in_margin
+            target = min(pub_max, reservation + cave_in_margin)
     else:
-        if role == "buyer":
-            target = reservation - margin
-        else:
-            target = reservation + margin
+        target = hold_price
             
     if state.last_offer_price is not None:
         if role == "buyer" and state.last_offer_price <= target:
@@ -242,8 +293,56 @@ def strategy_random_in_zopa(state: PriceState, params: Dict[str, Any]) -> PriceA
         if zopa_min <= state.last_offer_price <= zopa_max:
             if random.random() < 0.3:
                 return PriceAction(type="ACCEPT", price=None)
-                 
+
     return PriceAction(type="OFFER", price=round(offer, 2))
+
+
+def strategy_naive_concession(state: PriceState, params: Dict[str, Any]) -> PriceAction:
+    """
+    Naive Concession strategy - starts with one normal offer, then immediately concedes to a terrible position.
+    This is a "bad" strategy that demonstrates poor negotiation behavior.
+    First turn: offers at ZOPA boundary (normal selfish start)
+    Subsequent turns: offers very close to opponent's reservation (giving away the surplus).
+    """
+    reservation = state.effective_reservation_price
+    role = state.role
+    pub_min, pub_max = state.public_price_range if state.public_price_range else (0.0, 2000.0)
+
+    # Count own offers to see if this is the first turn
+    own_offers = [p for r, p in state.offer_history if r == role]
+    is_first_offer = len(own_offers) == 0
+
+    # Calculate symmetric starting positions around ZOPA
+    DEFAULT_ZOPA_WIDTH = 500.0
+    
+    if is_first_offer:
+        # First offer: start symmetrically around ZOPA
+        if role == "buyer":
+            first_price = max(pub_min, reservation - DEFAULT_ZOPA_WIDTH)  # Start 500 below reservation
+        else:
+            first_price = min(pub_max, reservation + DEFAULT_ZOPA_WIDTH)  # Start 500 above reservation
+        return PriceAction(type="OFFER", price=round(first_price, 2))
+    
+    # Subsequent offers: immediately concede to a terrible position (near own reservation)
+    # This is a "bad" strategy that gives away almost all surplus
+    buffer_pct = 0.05  # Only keep 5% margin from own reservation
+    
+    if role == "buyer":
+        # Buyer: offers very close to their own max (terrible deal for buyer)
+        buffer = (reservation - pub_min) * buffer_pct
+        naive_price = min(reservation, reservation - buffer)
+
+        if state.last_offer_price is not None and state.last_offer_price <= naive_price:
+            return PriceAction(type="ACCEPT", price=None)
+    else:
+        # Seller: offers very close to their own min (terrible deal for seller)
+        buffer = (pub_max - reservation) * buffer_pct
+        naive_price = max(reservation, reservation + buffer)
+
+        if state.last_offer_price is not None and state.last_offer_price >= naive_price:
+            return PriceAction(type="ACCEPT", price=None)
+
+    return PriceAction(type="OFFER", price=round(naive_price, 2))
 
 
 def strategy_micro(state: PriceState, params: Dict[str, Any]) -> PriceAction:
@@ -257,9 +356,13 @@ def strategy_micro(state: PriceState, params: Dict[str, Any]) -> PriceAction:
     
     pub_min, pub_max = state.public_price_range if state.public_price_range else (0.0, 2000.0)
     
+    # Use ZOPA bounds if provided, otherwise use public bounds
+    zopa_low = params.get("zopa_low", pub_min)
+    zopa_high = params.get("zopa_high", pub_max)
+    
     grid = []
-    curr = math.floor(pub_min)
-    end = math.ceil(pub_max)
+    curr = math.floor(zopa_low)
+    end = math.ceil(zopa_high)
     while curr <= end:
         grid.append(float(curr))
         curr += step_size
@@ -347,34 +450,54 @@ class StrategySpec:
 
 
 STRATEGY_REGISTRY: Dict[str, StrategySpec] = {
-    # Boulware Spectrum
+    # Boulware Spectrum - Selfish start (public bounds, no margin)
     "boulware_very_conceding": StrategySpec(
         "boulware_very_conceding",
-        "Rapidly concedes early (beta=0.2)",
+        "Rapidly concedes from public bounds (beta=0.2)",
         strategy_boulware,
-        {"beta": 0.2, "static_margin": 400.0}
+        {"beta": 0.2}  # No static_margin = start at public bounds (selfish)
     ),
     "boulware_conceding": StrategySpec(
         "boulware_conceding",
-        "Concedes moderately early (beta=0.5)",
+        "Concedes moderately from public bounds (beta=0.5)",
         strategy_boulware,
-        {"beta": 0.5, "static_margin": 400.0}
-    ),
-    "boulware_linear": StrategySpec(
-        "boulware_linear",
-        "Linear concession (beta=1.0)",
-        strategy_boulware,
-        {"beta": 1.0, "static_margin": 400.0}
+        {"beta": 0.5}  # No static_margin = start at public bounds (selfish)
     ),
     "boulware_firm": StrategySpec(
         "boulware_firm",
-        "Concedes slowly (beta=2.0)",
+        "Concedes slowly from public bounds (beta=2.0)",
         strategy_boulware,
-        {"beta": 2.0, "static_margin": 400.0}
+        {"beta": 2.0}  # No static_margin = start at public bounds (selfish)
     ),
     "boulware_hard": StrategySpec(
         "boulware_hard",
-        "Concedes very slowly (beta=4.0)",
+        "Concedes very slowly from public bounds (beta=4.0)",
+        strategy_boulware,
+        {"beta": 4.0}  # No static_margin = start at public bounds (selfish)
+    ),
+    
+    # Boulware Spectrum - With margin (for comparison, starts closer to reservation)
+    "boulware_very_conceding_margin": StrategySpec(
+        "boulware_very_conceding_margin",
+        "Rapidly concedes from margin (beta=0.2, margin=400)",
+        strategy_boulware,
+        {"beta": 0.2, "static_margin": 400.0}
+    ),
+    "boulware_conceding_margin": StrategySpec(
+        "boulware_conceding_margin",
+        "Concedes moderately from margin (beta=0.5, margin=400)",
+        strategy_boulware,
+        {"beta": 0.5, "static_margin": 400.0}
+    ),
+    "boulware_firm_margin": StrategySpec(
+        "boulware_firm_margin",
+        "Concedes slowly from margin (beta=2.0, margin=400)",
+        strategy_boulware,
+        {"beta": 2.0, "static_margin": 400.0}
+    ),
+    "boulware_hard_margin": StrategySpec(
+        "boulware_hard_margin",
+        "Concedes very slowly from margin (beta=4.0, margin=400)",
         strategy_boulware,
         {"beta": 4.0, "static_margin": 400.0}
     ),
@@ -393,52 +516,52 @@ STRATEGY_REGISTRY: Dict[str, StrategySpec] = {
         {"margin": 100.0}
     ),
 
-    # Tit for Tat
+    # Tit for Tat - Selfish start (no margin)
     "tit_for_tat": StrategySpec(
         "tit_for_tat",
-        "Mirrors opponent concessions",
+        "Mirrors opponent concessions from public bounds",
         strategy_tit_for_tat,
-        {"initial_margin": 100.0}
+        {}  # No initial_margin = start at public bounds
     ),
     
-    # Linear / Steady
+    # Linear / Steady - Selfish start (ZOPA boundary)
     "linear_standard": StrategySpec(
         "linear_standard",
-        "Standard linear concession",
+        "Standard linear concession from ZOPA boundary",
         strategy_linear,
-        {"static_margin": 400.0}
+        {}  # No static_margin = start at ZOPA boundary
     ),
 
-    # Split Difference
+    # Split Difference - Selfish start (ZOPA boundary)
     "split_difference": StrategySpec(
         "split_difference",
         "Splits difference between last offer and own history",
         strategy_split_difference,
-        {"initial_margin": 400.0}
+        {}  # No initial_margin = start at ZOPA boundary
     ),
     
-    # Time Dependent
+    # Time Dependent - Selfish start (ZOPA boundary)
     "time_dependent": StrategySpec(
         "time_dependent",
-        "Acceptance threshold relaxes over time",
+        "Acceptance threshold relaxes over time from ZOPA boundary",
         strategy_time_dependent_threshold,
-        {"margin": 200.0}
+        {}  # No margin = start at ZOPA boundary
     ),
     
-    # Hardliner
+    # Hardliner - Selfish start (ZOPA boundary) - stays strictly within ZOPA
     "hardliner": StrategySpec(
         "hardliner",
-        "Hold firm until final round",
+        "Hold firm at ZOPA boundary until final round",
         strategy_hardliner,
-        {"margin": 400.0}
+        {}  # No margin = hold at ZOPA boundary
     ),
     
-    # True Hardliner (No Cave-in)
-    "true_hardliner": StrategySpec(
-        "true_hardliner",
-        "Never concedes, never caves in",
+    # Hardliner with margin (for comparison)
+    "hardliner_margin": StrategySpec(
+        "hardliner_margin",
+        "Hold firm with margin until final round",
         strategy_hardliner,
-        {"margin": 400.0, "cave_in_margin": 400.0}
+        {"margin": 400.0}
     ),
     
     # Random Oracle
@@ -467,6 +590,14 @@ STRATEGY_REGISTRY: Dict[str, StrategySpec] = {
         "MiCRO agent with coarse grid (step=100.0)",
         strategy_micro,
         {"step_size": 100.0}
+    ),
+
+    # Bad Strategy - Naive Concession (concedes immediately to terrible position)
+    "naive_concession": StrategySpec(
+        "naive_concession",
+        "Immediately concedes 80% of ZOPA and sticks with it (bad strategy)",
+        strategy_naive_concession,
+        {}
     )
 }
 

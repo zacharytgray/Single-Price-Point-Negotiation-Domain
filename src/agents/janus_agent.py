@@ -216,18 +216,19 @@ class JanusAgent(BaseAgent):
 
         with torch.no_grad():
             outputs = self.model.generate(
-                **inputs, 
-                max_new_tokens=20, 
-                temperature=0.9,
-                do_sample=True
+                **inputs,
+                max_new_tokens=30,
+                temperature=0.7,
+                do_sample=True,
+                repetition_penalty=1.2,
+                early_stopping=True,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
             )
 
         output_text = self.tokenizer.decode(
             outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True
         ).strip()
-
-        # DEBUG: Print raw model output
-        print(f"  [DEBUG] JanusAgent raw output: '{output_text}'")
 
         if "ACCEPT" in output_text:
             return "ACCEPT"
@@ -238,12 +239,10 @@ class JanusAgent(BaseAgent):
                 val_norm = float(match.group(1))
                 price_real = self._denormalize(val_norm, p_low, p_high)
                 price_real = round(price_real, 2)
-                print(f"  [DEBUG] Parsed norm={val_norm:.4f} -> real price={price_real:.2f}")
                 return f"OFFER {price_real}"
             except Exception:
                 pass
 
-        print(f"  [DEBUG] No valid offer found, falling back to reservation: {reservation}")
         return f"OFFER {reservation}"
 
     # ------------------------------------------------------------------
