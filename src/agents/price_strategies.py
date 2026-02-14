@@ -65,17 +65,37 @@ def strategy_boulware(state: PriceState, params: Dict[str, Any]) -> PriceAction:
 
 def strategy_price_fixed(state: PriceState, params: Dict[str, Any]) -> PriceAction:
     """
-    Fixed Price strategy: Always offers reservation +/- margin.
+    Fixed Price strategy: Always offers a fixed position inside the ZOPA.
+    
+    Buyer offers LOW (just above seller's reservation + margin) to get good deals.
+    Seller offers HIGH (just below buyer's reservation - margin) to get good deals.
+    
+    Uses ZOPA bounds if available, otherwise estimates from public price range.
     """
     margin = params.get("margin", 0.0)
     reservation = state.effective_reservation_price
+    pub_min, pub_max = state.public_price_range if state.public_price_range else (0.0, 2000.0)
+    
+    # Estimate opponent's reservation from ZOPA bounds if available, else from public range
+    # Standard ZOPA width is 500, so opponent's reservation is 500 away
+    DEFAULT_ZOPA_WIDTH = 500.0
     
     if state.role == "buyer":
-        target_price = reservation - margin
+        # Buyer estimates seller's reservation (buyer's max - 500)
+        # and offers LOW but INSIDE ZOPA: seller_res + margin
+        seller_reservation = reservation - DEFAULT_ZOPA_WIDTH
+        target_price = seller_reservation + margin
+        target_price = max(seller_reservation, target_price)  # Stay at or above seller's min
+        
         if state.last_offer_price is not None and state.last_offer_price <= target_price:
             return PriceAction(type="ACCEPT", price=None)
     else:
-        target_price = reservation + margin
+        # Seller estimates buyer's reservation (seller's min + 500)
+        # and offers HIGH but INSIDE ZOPA: buyer_res - margin
+        buyer_reservation = reservation + DEFAULT_ZOPA_WIDTH
+        target_price = buyer_reservation - margin
+        target_price = min(buyer_reservation, target_price)  # Stay at or below buyer's max
+        
         if state.last_offer_price is not None and state.last_offer_price >= target_price:
             return PriceAction(type="ACCEPT", price=None)
             

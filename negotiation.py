@@ -431,8 +431,10 @@ def main():
         # Optionally randomize strategies for diversity
         if args.randomize_strategies:
             from src.agents.price_strategies import STRATEGY_REGISTRY
-            buyer_strat = random.choice(list(STRATEGY_REGISTRY.keys()))
-            seller_strat = random.choice(list(STRATEGY_REGISTRY.keys()))
+            # Exclude micro strategies from randomization
+            available_strategies = [k for k in STRATEGY_REGISTRY.keys() if not k.startswith('micro_')]
+            buyer_strat = random.choice(available_strategies)
+            seller_strat = random.choice(available_strategies)
             
             # Create new agents with random strategies
             episode_buyer = create_agent(
