@@ -49,15 +49,19 @@ from src.domain.single_issue_price_domain import SingleIssuePriceDomain
 DEFAULT_EPISODES_PER_STRATEGY = 50
 LOG_DIR = "logs"
 
-# Strategies to exclude (random and margin variants are duplicates)
+# Strategies to exclude (random, margin variants, and micro strategies)
 EXCLUDED_STRATEGIES = {
     'random_zopa',  # Random strategy
     # Margin variants (same logic with different param)
     'boulware_very_conceding_margin',
-    'boulware_conceding_margin', 
+    'boulware_conceding_margin',
     'boulware_firm_margin',
     'boulware_hard_margin',
     'hardliner_margin',
+    # Micro strategies
+    'micro_fine',
+    'micro_moderate',
+    'micro_coarse',
 }
 
 
@@ -85,6 +89,7 @@ class BenchmarkResult:
     zopa_width: float
     starting_agent: str
     timestamp: str
+    offer_history: str  # JSON string of offer history
 
 
 @dataclass
@@ -134,14 +139,15 @@ class BenchmarkLogger:
                     'episode_id', 'strategy', 'janus_role', 'agreement',
                     'final_price', 'turns', 'janus_utility', 'janus_norm_utility',
                     'opponent_utility', 'opponent_norm_utility',
-                    'buyer_max', 'seller_min', 'zopa_width', 'starting_agent', 'timestamp'
+                    'buyer_max', 'seller_min', 'zopa_width', 'starting_agent', 'timestamp',
+                    'offer_history'
                 ])
             writer.writerow([
                 result.episode_id, result.strategy, result.janus_role, result.agreement,
                 result.final_price, result.turns, result.janus_utility, result.janus_norm_utility,
                 result.opponent_utility, result.opponent_norm_utility,
                 result.buyer_max, result.seller_min, result.zopa_width, result.starting_agent,
-                result.timestamp
+                result.timestamp, result.offer_history
             ])
     
     def save_summary(self, summaries: List[StrategySummary]):
@@ -229,6 +235,7 @@ async def run_episode(
     janus_agent.p_high = PRICE_RANGE_HIGH
     
     history: List[Tuple[str, float]] = []
+    offer_history_log: List[Dict[str, Any]] = []  # Detailed offer history
     last_offer: Optional[float] = None
     
     opponent_role = "seller" if janus_role == "buyer" else "buyer"
@@ -266,12 +273,26 @@ async def run_episode(
             if action.action_type == "OFFER" and action.offer_content is not None:
                 last_offer = action.offer_content
                 history.append((janus_role, last_offer))
+                offer_history_log.append({
+                    'turn': turn,
+                    'agent': 'janus',
+                    'role': janus_role,
+                    'action': 'OFFER',
+                    'price': last_offer
+                })
                 domain.current_offer = last_offer
                 domain.last_offerer_id = janus_agent_num
                 
             elif action.action_type == "ACCEPT" and last_offer is not None:
                 agreement_reached = True
                 final_price = last_offer
+                offer_history_log.append({
+                    'turn': turn,
+                    'agent': 'janus',
+                    'role': janus_role,
+                    'action': 'ACCEPT',
+                    'price': last_offer
+                })
                 
             current_agent = "opponent"
             
@@ -293,12 +314,26 @@ async def run_episode(
             if action.type == "OFFER":
                 last_offer = action.price
                 history.append((opponent_role, last_offer))
+                offer_history_log.append({
+                    'turn': turn,
+                    'agent': 'opponent',
+                    'role': opponent_role,
+                    'action': 'OFFER',
+                    'price': last_offer
+                })
                 domain.current_offer = last_offer
                 domain.last_offerer_id = opponent_agent_num
                 
             elif action.type == "ACCEPT" and last_offer is not None:
                 agreement_reached = True
                 final_price = last_offer
+                offer_history_log.append({
+                    'turn': turn,
+                    'agent': 'opponent',
+                    'role': opponent_role,
+                    'action': 'ACCEPT',
+                    'price': last_offer
+                })
             
             current_agent = "janus"
     
@@ -327,6 +362,9 @@ async def run_episode(
         if verbose:
             print(f"  IMPASSE after {turn} turns")
     
+    # Convert offer history to JSON string
+    offer_history_json = json.dumps(offer_history_log)
+    
     result = BenchmarkResult(
         episode_id=episode_id,
         strategy=strategy_name,
@@ -342,7 +380,8 @@ async def run_episode(
         seller_min=seller_min,
         zopa_width=zopa_width,
         starting_agent=starting_agent,
-        timestamp=datetime.now().isoformat()
+        timestamp=datetime.now().isoformat(),
+        offer_history=offer_history_json
     )
     
     logger.log_episode(result)

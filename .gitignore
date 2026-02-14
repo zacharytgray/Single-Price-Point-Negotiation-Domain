@@ -16,3 +16,5 @@ output/
 decision_steps.parquet
 trajectory_outcomes.parquet
 .DS_Store
+benchmark_analysis/
+strategy_curve_plots/
