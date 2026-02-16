@@ -431,8 +431,9 @@ def main():
         # Optionally randomize strategies for diversity
         if args.randomize_strategies:
             from src.agents.price_strategies import STRATEGY_REGISTRY
-            # Exclude micro strategies from randomization
-            available_strategies = [k for k in STRATEGY_REGISTRY.keys() if not k.startswith('micro_')]
+            # Exclude price_fixed strategies from randomization (micro strategies are allowed)
+            excluded_prefixes = ('price_fixed_',)
+            available_strategies = [k for k in STRATEGY_REGISTRY.keys() if not k.startswith(excluded_prefixes)]
             buyer_strat = random.choice(available_strategies)
             seller_strat = random.choice(available_strategies)
             

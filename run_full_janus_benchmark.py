@@ -1,13 +1,13 @@
 """
-Full Janus Benchmark - Comprehensive evaluation against deterministic strategies.
+Full Benchmark - Comprehensive evaluation of Janus or Base Model against deterministic strategies.
 
-Tests Janus agent against all unique deterministic strategies (50 episodes each),
-excluding random strategies and margin variants (duplicates).
+Tests agent (Janus or base Qwen via Ollama) against all unique deterministic strategies.
 
 Usage:
     python run_full_janus_benchmark.py
     python run_full_janus_benchmark.py --janus_rho 0.5 --episodes_per_strategy 50
     python run_full_janus_benchmark.py --buyer_rho 0.2 --seller_rho 0.8
+    python run_full_janus_benchmark.py --use_base_model --model_name qwen2:7b
 """
 
 import asyncio
@@ -40,7 +40,10 @@ from config.settings import (
     JANUS_MODEL_PATH
 )
 from src.agents.price_strategies import STRATEGY_REGISTRY, DeterministicPriceAgent
-from src.agents.janus_agent import JanusAgent
+from src.agents.ollama_agent import OllamaAgent
+
+# JanusAgent imported conditionally when not using base model
+JanusAgent = None
 from src.core.price_structures import PriceState
 from src.domain.single_issue_price_domain import SingleIssuePriceDomain
 
@@ -49,19 +52,12 @@ from src.domain.single_issue_price_domain import SingleIssuePriceDomain
 DEFAULT_EPISODES_PER_STRATEGY = 50
 LOG_DIR = "logs"
 
-# Strategies to exclude (random, margin variants, and micro strategies)
+# Strategies to exclude from benchmarking
 EXCLUDED_STRATEGIES = {
-    'random_zopa',  # Random strategy
-    # Margin variants (same logic with different param)
-    'boulware_very_conceding_margin',
-    'boulware_conceding_margin',
-    'boulware_firm_margin',
-    'boulware_hard_margin',
-    'hardliner_margin',
-    # Micro strategies
-    'micro_fine',
-    'micro_moderate',
-    'micro_coarse',
+    'random_zopa',  # Random strategy (oracle)
+    # Price fixed strategies (not realistic for benchmarking)
+    'price_fixed_strict',
+    'price_fixed_loose',
 }
 
 
@@ -212,7 +208,7 @@ def create_price_state(
 
 
 async def run_episode(
-    janus_agent: JanusAgent,
+    janus_agent,
     opponent: DeterministicPriceAgent,
     janus_role: str,
     buyer_max: float,
@@ -221,7 +217,9 @@ async def run_episode(
     episode_id: int,
     strategy_name: str,
     logger: BenchmarkLogger,
-    verbose: bool = False
+    verbose: bool = False,
+    use_base_model: bool = False,
+    debug_base_model: bool = False
 ) -> BenchmarkResult:
     """Run a single negotiation episode."""
     
@@ -230,9 +228,10 @@ async def run_episode(
     domain.buyer_max = buyer_max
     domain.seller_min = seller_min
     
-    # Update Janus price bounds
-    janus_agent.p_low = PRICE_RANGE_LOW
-    janus_agent.p_high = PRICE_RANGE_HIGH
+    # Update Janus price bounds (only for Janus agent)
+    if not use_base_model:
+        janus_agent.p_low = PRICE_RANGE_LOW
+        janus_agent.p_high = PRICE_RANGE_HIGH
     
     history: List[Tuple[str, float]] = []
     offer_history_log: List[Dict[str, Any]] = []  # Detailed offer history
@@ -250,25 +249,63 @@ async def run_episode(
     turn = 0
     
     if verbose:
-        print(f"\n  Episode {episode_id} | Janus={janus_role} vs {strategy_name} | Start={starting_agent}")
+        agent_label = "Base" if use_base_model else "Janus"
+        print(f"\n  Episode {episode_id} | {agent_label}={janus_role} vs {strategy_name} | Start={starting_agent}")
         print(f"  ZOPA: Seller Min=${seller_min:.2f}, Buyer Max=${buyer_max:.2f}")
+    if use_base_model and debug_base_model:
+        reservation = buyer_max if janus_role == "buyer" else seller_min
+        print(
+            f"  [DEBUG][Base] role={janus_role} reservation={reservation:.2f} "
+            f"(buyer_max={buyer_max:.2f}, seller_min={seller_min:.2f})"
+        )
     
     while turn < MAX_TURNS and not agreement_reached:
         turn += 1
         
         if current_agent == "janus":
             # Janus's turn
-            janus_agent.domain_private_context = {
-                "role": janus_role,
-                "turn": turn,
-                "max_turns": MAX_TURNS,
-                "history": history,
-                "max_willingness_to_pay": buyer_max if janus_role == "buyer" else None,
-                "min_acceptable_price": seller_min if janus_role == "seller" else None,
-            }
-            
-            response = await janus_agent.generate_response()
+            if use_base_model:
+                # Use OllamaAgent's built-in prompt builder
+                prompt = janus_agent.build_prompt(
+                    turn=turn,
+                    last_offer=last_offer,
+                    history=history
+                )
+                if verbose:
+                    print(f"\n  === PROMPT (turn {turn}) ===")
+                    print(prompt)
+                    print("  ============================\n")
+                t0 = time.perf_counter()
+                response = await janus_agent.generate_response(input_text_role="user", input_text=prompt)
+                response_latency = time.perf_counter() - t0
+                if debug_base_model:
+                    print(f"  [DEBUG][Base] model_response_time={response_latency:.3f}s")
+                    print(f"  [DEBUG][Base] raw_action_text={response}")
+                    print("  [DEBUG][Base] FULL AGENT MEMORY START")
+                    janus_agent.print_memory(skip_system_message=False)
+                    print("  [DEBUG][Base] FULL AGENT MEMORY END")
+            else:
+                # Use Janus native prompting
+                janus_context = {
+                    "role": janus_role,
+                    "turn": turn,
+                    "max_turns": MAX_TURNS,
+                    "history": history,
+                }
+                if janus_role == "buyer":
+                    janus_context["max_willingness_to_pay"] = buyer_max
+                else:
+                    janus_context["min_acceptable_price"] = seller_min
+
+                janus_agent.domain_private_context = janus_context
+                response = await janus_agent.generate_response()
             action = domain.parse_agent_action(janus_agent_num, response)
+
+            if debug_base_model and use_base_model:
+                print(
+                    f"  [DEBUG][Base] parsed_action={action.action_type} "
+                    f"price={action.offer_content}"
+                )
             
             if action.action_type == "OFFER" and action.offer_content is not None:
                 last_offer = action.offer_content
@@ -293,6 +330,17 @@ async def run_episode(
                     'action': 'ACCEPT',
                     'price': last_offer
                 })
+            elif action.action_type == "INVALID":
+                offer_history_log.append({
+                    'turn': turn,
+                    'agent': 'janus',
+                    'role': janus_role,
+                    'action': 'INVALID',
+                    'price': None,
+                    'raw_text': response
+                })
+                if debug_base_model:
+                    print("  [DEBUG][Base] INVALID action parsed; passing turn without offer update")
                 
             current_agent = "opponent"
             
@@ -351,7 +399,8 @@ async def run_episode(
         opponent_norm = opponent_utility / zopa_width if zopa_width > 0 else 0
         
         if verbose:
-            print(f"  AGREEMENT at ${final_price:.2f} | Janus={janus_norm:.2%} | Opp={opponent_norm:.2%}")
+            agent_label = "Base" if use_base_model else "Janus"
+            print(f"  AGREEMENT at ${final_price:.2f} | {agent_label}={janus_norm:.2%} | Opp={opponent_norm:.2%}")
     else:
         janus_utility = 0.0
         opponent_utility = 0.0
@@ -436,13 +485,14 @@ def calculate_strategy_summary(strategy: str, results: List[BenchmarkResult]) ->
     )
 
 
-def print_summary_table(summaries: List[StrategySummary]):
+def print_summary_table(summaries: List[StrategySummary], agent_label: str = "Janus"):
     """Print formatted summary table."""
     print(f"\n{Fore.CYAN}{'='*100}")
     print("BENCHMARK SUMMARY")
     print(f"{'='*100}{Fore.RESET}\n")
     
-    print(f"{'Strategy':<25} {'Ep':>4} {'Agr':>4} {'Agr%':>6} {'Jan%':>7} {'Opp%':>7} {'Ties':>5} {'Turns':>6}")
+    agent_pct_label = f"{agent_label[:3]}%" if len(agent_label) >= 3 else f"{agent_label}%"
+    print(f"{'Strategy':<25} {'Ep':>4} {'Agr':>4} {'Agr%':>6} {agent_pct_label:>7} {'Opp%':>7} {'Ties':>5} {'Turns':>6}")
     print("-" * 100)
     
     total_episodes = 0
@@ -473,25 +523,62 @@ def print_summary_table(summaries: List[StrategySummary]):
     print(f"{'OVERALL':<25} {total_episodes:>4} {total_agreements:>4} {overall_agr:>6.1f} "
           f"{overall_janus*100:>6.1f}% {overall_opp*100:>6.1f}% {total_ties:>5}")
     
-    print(f"\n{Fore.GREEN}Janus wins: {total_janus_wins} | Opponent wins: {total_opponent_wins} | Ties: {total_ties}{Fore.RESET}")
+    print(f"\n{Fore.GREEN}{agent_label} wins: {total_janus_wins} | Opponent wins: {total_opponent_wins} | Ties: {total_ties}{Fore.RESET}")
+
+
+def get_balanced_episode_assignment(ep_index: int) -> Tuple[str, str]:
+        """Return (janus_role, starting_agent) with balanced 4-way coverage.
+
+        Pattern repeats every 4 episodes:
+            buyer+janus-first, buyer+opponent-first, seller+janus-first, seller+opponent-first
+        """
+        pattern = [
+                ("buyer", "janus"),
+                ("buyer", "opponent"),
+                ("seller", "janus"),
+                ("seller", "opponent"),
+        ]
+        return pattern[ep_index % len(pattern)]
 
 
 async def benchmark_strategy(
     strategy_name: str,
     episodes: int,
-    janus_buyer: JanusAgent,
-    janus_seller: JanusAgent,
+    janus_buyer: Optional[JanusAgent],
+    janus_seller: Optional[JanusAgent],
     logger: BenchmarkLogger,
-    verbose: bool = False
+    use_base_model: bool = False,
+    model_name: str = "qwen2:7b",
+    verbose: bool = False,
+    debug_base_model: bool = False
 ) -> List[BenchmarkResult]:
     """Run benchmark for a single strategy."""
     
     results = []
     
     for ep in range(1, episodes + 1):
-        # Alternate Janus role
-        janus_role = "buyer" if ep % 2 == 1 else "seller"
-        janus_agent = janus_buyer if janus_role == "buyer" else janus_seller
+        ep_index = ep - 1
+        # Generate ZOPA first (needed for agent creation)
+        buyer_max = round(random.gauss(DEFAULT_BUYER_MAX_MEAN, DEFAULT_BUYER_MAX_STD), 2)
+        seller_min = round(buyer_max - FIXED_ZOPA_WIDTH, 2)
+        
+        # Balanced Janus/base role + turn order assignment
+        janus_role, starting_agent = get_balanced_episode_assignment(ep_index)
+        
+        # Get or create Janus agent
+        if use_base_model:
+            # Create base model agent with proper context
+            reservation = buyer_max if janus_role == "buyer" else seller_min
+            janus_agent = OllamaAgent(
+                model_name=model_name,
+                role=janus_role,
+                reservation_price=reservation,
+                max_turns=MAX_TURNS,
+                system_instructions=None,  # No Janus system instructions for base model
+                debug=debug_base_model
+            )
+        else:
+            janus_agent = janus_buyer if janus_role == "buyer" else janus_seller
         
         # Create opponent
         opponent_role = "seller" if janus_role == "buyer" else "buyer"
@@ -500,27 +587,30 @@ async def benchmark_strategy(
             strategy_name=strategy_name
         )
         
-        # Randomize starting agent
-        starting_agent = random.choice(["janus", "opponent"])
-        
-        # Generate ZOPA
-        buyer_max = round(random.gauss(DEFAULT_BUYER_MAX_MEAN, DEFAULT_BUYER_MAX_STD), 2)
-        seller_min = round(buyer_max - FIXED_ZOPA_WIDTH, 2)
-        
-        result = await run_episode(
-            janus_agent=janus_agent,
-            opponent=opponent,
-            janus_role=janus_role,
-            buyer_max=buyer_max,
-            seller_min=seller_min,
-            starting_agent=starting_agent,
-            episode_id=ep,
-            strategy_name=strategy_name,
-            logger=logger,
-            verbose=verbose
-        )
-        
-        results.append(result)
+        try:
+            result = await run_episode(
+                janus_agent=janus_agent,
+                opponent=opponent,
+                janus_role=janus_role,
+                buyer_max=buyer_max,
+                seller_min=seller_min,
+                starting_agent=starting_agent,
+                episode_id=ep,
+                strategy_name=strategy_name,
+                logger=logger,
+                verbose=verbose,
+                use_base_model=use_base_model,
+                debug_base_model=debug_base_model
+            )
+            results.append(result)
+        except Exception as e:
+            if verbose:
+                print(f"    Episode {ep} error: {e}")
+        finally:
+            # Clean up Ollama agent if using base model
+            if use_base_model:
+                del janus_agent
+                gc.collect()
         
         # Print progress every 10 episodes
         if ep % 10 == 0:
@@ -552,12 +642,28 @@ async def main():
         help="Rho value for Janus in both roles (overrides buyer/seller rho)"
     )
     parser.add_argument(
+        "--janus_adapter", type=str, default=None,
+        help="Path to Janus adapter checkpoint (default: from config/settings.py)"
+    )
+    parser.add_argument(
         "--verbose", action="store_true",
         help="Print detailed episode logs"
     )
     parser.add_argument(
         "--strategies", type=str, nargs="+", default=None,
         help="Specific strategies to test (default: all non-excluded)"
+    )
+    parser.add_argument(
+        "--use_base_model", action="store_true",
+        help="Use base Qwen model via Ollama instead of Janus"
+    )
+    parser.add_argument(
+        "--model_name", type=str, default="qwen2:7b",
+        help="Ollama model name for base model (default: qwen2:7b)"
+    )
+    parser.add_argument(
+        "--debug_base_model", action="store_true",
+        help="Enable detailed per-turn debug logs for base model inference/parsing"
     )
     args = parser.parse_args()
     
@@ -569,16 +675,25 @@ async def main():
         buyer_rho = args.buyer_rho
         seller_rho = args.seller_rho
     
+    # Handle janus_adapter override
+    janus_adapter_path = args.janus_adapter if args.janus_adapter else JANUS_ADAPTER_PATH
+    
     # Get strategies to test
     strategies = args.strategies if args.strategies else get_benchmark_strategies()
     
-    print(f"{Fore.MAGENTA}{'='*80}")
-    print("FULL JANUS BENCHMARK")
-    print(f"{'='*80}{Fore.RESET}")
+    if args.use_base_model:
+        print(f"{Fore.MAGENTA}{'='*80}")
+        print(f"FULL BASE MODEL BENCHMARK ({args.model_name})")
+        print(f"{'='*80}{Fore.RESET}")
+    else:
+        print(f"{Fore.MAGENTA}{'='*80}")
+        print("FULL JANUS BENCHMARK")
+        print(f"{'='*80}{Fore.RESET}")
     print(f"\nConfiguration:")
     print(f"  Episodes per strategy: {args.episodes_per_strategy}")
-    print(f"  Janus buyer rho: {buyer_rho}")
-    print(f"  Janus seller rho: {seller_rho}")
+    if not args.use_base_model:
+        print(f"  Janus buyer rho: {buyer_rho}")
+        print(f"  Janus seller rho: {seller_rho}")
     print(f"  Total strategies: {len(strategies)}")
     print(f"  Total episodes: {len(strategies) * args.episodes_per_strategy}")
     print(f"\nStrategies to test:")
@@ -587,29 +702,37 @@ async def main():
     print()
     
     # Initialize logger
-    logger = BenchmarkLogger("janus_full_benchmark")
+    if args.use_base_model:
+        logger = BenchmarkLogger(f"base_{args.model_name.replace(':', '_')}_benchmark")
+    else:
+        logger = BenchmarkLogger("janus_full_benchmark")
     print(f"{Fore.GREEN}Logging to: {logger.get_csv_path()}{Fore.RESET}\n")
     
-    # Create Janus agents (reused across all strategies)
-    print(f"{Fore.YELLOW}Initializing Janus agents...{Fore.RESET}")
-    
-    janus_buyer = JanusAgent(
-        agent_id=1,
-        role="buyer",
-        model_path=JANUS_MODEL_PATH,
-        adapter_path=JANUS_ADAPTER_PATH,
-        rho=buyer_rho
-    )
-    
-    janus_seller = JanusAgent(
-        agent_id=2,
-        role="seller",
-        model_path=JANUS_MODEL_PATH,
-        adapter_path=JANUS_ADAPTER_PATH,
-        rho=seller_rho
-    )
-    
-    print(f"{Fore.GREEN}Janus agents ready!{Fore.RESET}\n")
+    # Create agents
+    if args.use_base_model:
+        print(f"{Fore.YELLOW}Initializing base model ({args.model_name})...{Fore.RESET}")
+        from config.settings import PRICE_DETERMINISTIC_INSTRUCTIONS_FILE
+        janus_buyer = None  # Will create per-episode
+        janus_seller = None  # Will create per-episode
+    else:
+        print(f"{Fore.YELLOW}Initializing Janus agents...{Fore.RESET}")
+        # Import JanusAgent only when needed
+        from src.agents.janus_agent import JanusAgent
+        janus_buyer = JanusAgent(
+            agent_id=1,
+            role="buyer",
+            model_path=JANUS_MODEL_PATH,
+            adapter_path=janus_adapter_path,
+            rho=buyer_rho
+        )
+        janus_seller = JanusAgent(
+            agent_id=2,
+            role="seller",
+            model_path=JANUS_MODEL_PATH,
+            adapter_path=janus_adapter_path,
+            rho=seller_rho
+        )
+        print(f"{Fore.GREEN}Janus agents ready!{Fore.RESET}\n")
     
     # Run benchmarks
     all_results: List[BenchmarkResult] = []
@@ -627,7 +750,10 @@ async def main():
                 janus_buyer=janus_buyer,
                 janus_seller=janus_seller,
                 logger=logger,
-                verbose=args.verbose
+                use_base_model=args.use_base_model,
+                model_name=args.model_name,
+                verbose=args.verbose,
+                debug_base_model=args.debug_base_model
             )
             
             all_results.extend(results)
@@ -635,8 +761,9 @@ async def main():
             summaries.append(summary)
             
             # Print mini summary
+            agent_label = "Base" if args.use_base_model else "Janus"
             print(f"  {Fore.GREEN}Complete:{Fore.RESET} Agr={summary.agreement_rate:.1f}% "
-                  f"Janus={summary.avg_janus_norm:.2%} Opp={summary.avg_opponent_norm:.2%}")
+                  f"{agent_label}={summary.avg_janus_norm:.2%} Opp={summary.avg_opponent_norm:.2%}")
             
         except Exception as e:
             print(f"{Fore.RED}  ERROR: {e}{Fore.RESET}")
@@ -647,7 +774,8 @@ async def main():
     total_time = time.time() - start_time
     
     # Print final summary
-    print_summary_table(summaries)
+    agent_label = "Base" if args.use_base_model else "Janus"
+    print_summary_table(summaries, agent_label=agent_label)
     
     # Save summary
     logger.save_summary(summaries)

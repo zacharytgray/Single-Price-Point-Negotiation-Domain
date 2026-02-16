@@ -38,15 +38,10 @@ INDEPENDENT_STRATEGIES = [
     "linear_standard",
     "price_fixed_strict",
     "price_fixed_loose",
-    "time_dependent",
     "hardliner",
-    # Margin variants (start closer to reservation)
-    "boulware_very_conceding_margin",
-    "boulware_conceding_margin",
-    "boulware_firm_margin",
-    "boulware_hard_margin",
-    # Bad strategy (immediately concedes to terrible position)
-    "naive_concession"
+    # Bad strategies
+    "naive_concession",
+    "naive_linear"
 ]
 
 REACTIVE_STRATEGIES = [

@@ -311,8 +311,9 @@ def main():
     # Load data
     df = load_results(csv_path)
     
-    # Filter out micro strategies
-    df = df[~df['strategy'].str.startswith('micro_')].copy()
+    # Filter out random and price_fixed strategies
+    excluded = ['random_zopa', 'price_fixed_strict', 'price_fixed_loose']
+    df = df[~df['strategy'].isin(excluded)].copy()
     
     # Get unique strategies
     strategies = sorted(df['strategy'].unique())

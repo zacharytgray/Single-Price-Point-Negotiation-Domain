@@ -317,49 +317,98 @@ def strategy_random_in_zopa(state: PriceState, params: Dict[str, Any]) -> PriceA
     return PriceAction(type="OFFER", price=round(offer, 2))
 
 
-def strategy_naive_concession(state: PriceState, params: Dict[str, Any]) -> PriceAction:
+def strategy_naive_linear(state: PriceState, params: Dict[str, Any]) -> PriceAction:
     """
-    Naive Concession strategy - starts with one normal offer, then immediately concedes to a terrible position.
-    This is a "bad" strategy that demonstrates poor negotiation behavior.
-    First turn: offers at ZOPA boundary (normal selfish start)
-    Subsequent turns: offers very close to opponent's reservation (giving away the surplus).
+    Naive Linear strategy - concedes in the WRONG direction (FLIPPED from normal).
+    
+    Normal linear: buyer starts LOW, goes UP toward reservation (conceding by offering more)
+    Naive linear:  buyer starts HIGH, goes DOWN away from reservation (offering LESS over time!)
+    
+    Normal linear: seller starts HIGH, goes DOWN toward reservation (conceding by accepting less)  
+    Naive linear:  seller starts LOW, goes UP away from reservation (asking for MORE over time!)
+    
+    This is completely backwards - the agent gets progressively MORE aggressive as deadline approaches.
     """
     reservation = state.effective_reservation_price
     role = state.role
     pub_min, pub_max = state.public_price_range if state.public_price_range else (0.0, 2000.0)
-
-    # Count own offers to see if this is the first turn
-    own_offers = [p for r, p in state.offer_history if r == role]
-    is_first_offer = len(own_offers) == 0
-
-    # Calculate symmetric starting positions around ZOPA
+    
+    # Calculate time fraction
     DEFAULT_ZOPA_WIDTH = 500.0
-    
-    if is_first_offer:
-        # First offer: start symmetrically around ZOPA
-        if role == "buyer":
-            first_price = max(pub_min, reservation - DEFAULT_ZOPA_WIDTH)  # Start 500 below reservation
-        else:
-            first_price = min(pub_max, reservation + DEFAULT_ZOPA_WIDTH)  # Start 500 above reservation
-        return PriceAction(type="OFFER", price=round(first_price, 2))
-    
-    # Subsequent offers: immediately concede to a terrible position (near own reservation)
-    # This is a "bad" strategy that gives away almost all surplus
-    buffer_pct = 0.05  # Only keep 5% margin from own reservation
+    concession_cap = params.get("concession_cap", 0.95)
+    time_frac = min(concession_cap, state.timestep / state.max_turns)
     
     if role == "buyer":
-        # Buyer: offers very close to their own max (terrible deal for buyer)
-        buffer = (reservation - pub_min) * buffer_pct
-        naive_price = min(reservation, reservation - buffer)
-
-        if state.last_offer_price is not None and state.last_offer_price <= naive_price:
+        # Buyer starts at reservation (high) and goes DOWN toward pub_min (LOWER offers over time!)
+        # This is backwards - should start low and increase, but we start high and decrease
+        start_price = reservation  # Start at max willingness to pay (terrible opening)
+        end_price = max(pub_min, reservation - DEFAULT_ZOPA_WIDTH * 2)  # Go way below normal ZOPA
+        target_price = start_price - (start_price - end_price) * time_frac  # Move DOWN
+        target_price = max(target_price, pub_min)
+        
+        # Accept if opponent offers something reasonable (we're naive but not stupid)
+        if state.last_offer_price is not None and state.last_offer_price <= reservation:
             return PriceAction(type="ACCEPT", price=None)
     else:
-        # Seller: offers very close to their own min (terrible deal for seller)
-        buffer = (pub_max - reservation) * buffer_pct
-        naive_price = max(reservation, reservation + buffer)
+        # Seller starts at reservation (low) and goes UP toward pub_max (HIGHER offers over time!)
+        # This is backwards - should start high and decrease, but we start low and increase
+        start_price = reservation  # Start at min willingness to accept (terrible opening)
+        end_price = min(pub_max, reservation + DEFAULT_ZOPA_WIDTH * 2)  # Go way above normal ZOPA
+        target_price = start_price + (end_price - start_price) * time_frac  # Move UP
+        target_price = min(target_price, pub_max)
+        
+        # Accept if opponent offers something reasonable
+        if state.last_offer_price is not None and state.last_offer_price >= reservation:
+            return PriceAction(type="ACCEPT", price=None)
 
-        if state.last_offer_price is not None and state.last_offer_price >= naive_price:
+    return PriceAction(type="OFFER", price=round(target_price, 2))
+
+
+def strategy_naive_concession(state: PriceState, params: Dict[str, Any]) -> PriceAction:
+    """
+    Naive Concession strategy - consistently makes bad offers with slight random variation.
+    
+    This agent doesn't understand negotiation dynamics and simply makes offers
+    that are terrible for itself (but great for the opponent).
+    
+    Buyer: Offers near its reservation (high prices) - pays way too much
+    Seller: Offers near its reservation (low prices) - earns way too little
+    
+    Adds small random jitter to vary offers slightly, but never makes "good" offers.
+    """
+    reservation = state.effective_reservation_price
+    role = state.role
+    pub_min, pub_max = state.public_price_range if state.public_price_range else (0.0, 2000.0)
+    
+    # Calculate the "bad" offer zone - near own reservation
+    # Use a small buffer so we don't accidentally offer beyond reservation
+    buffer = params.get("buffer", 25.0)  # Stay within $25 of own reservation
+    jitter = params.get("jitter", 15.0)  # Random variation up to $15
+    
+    # Generate base "bad" offer near own reservation
+    if role == "buyer":
+        # Bad for buyer = high price near reservation
+        base_price = reservation - buffer  # Close to max willing to pay
+        # Add random jitter (could go slightly higher or lower, but always bad)
+        variation = random.uniform(-jitter, jitter)
+        naive_price = base_price + variation
+        # Clamp to valid range
+        naive_price = max(pub_min, min(naive_price, reservation))
+        
+        # Accept if opponent offers something reasonable (we're naive!)
+        if state.last_offer_price is not None and state.last_offer_price <= reservation:
+            return PriceAction(type="ACCEPT", price=None)
+    else:
+        # Bad for seller = low price near reservation
+        base_price = reservation + buffer  # Close to min willing to accept
+        # Add random jitter
+        variation = random.uniform(-jitter, jitter)
+        naive_price = base_price - variation
+        # Clamp to valid range
+        naive_price = max(reservation, min(naive_price, pub_max))
+        
+        # Accept if opponent offers something reasonable
+        if state.last_offer_price is not None and state.last_offer_price >= reservation:
             return PriceAction(type="ACCEPT", price=None)
 
     return PriceAction(type="OFFER", price=round(naive_price, 2))
@@ -496,32 +545,6 @@ STRATEGY_REGISTRY: Dict[str, StrategySpec] = {
         {"beta": 4.0}  # No static_margin = start at public bounds (selfish)
     ),
     
-    # Boulware Spectrum - With margin (for comparison, starts closer to reservation)
-    "boulware_very_conceding_margin": StrategySpec(
-        "boulware_very_conceding_margin",
-        "Rapidly concedes from margin (beta=0.2, margin=400)",
-        strategy_boulware,
-        {"beta": 0.2, "static_margin": 400.0}
-    ),
-    "boulware_conceding_margin": StrategySpec(
-        "boulware_conceding_margin",
-        "Concedes moderately from margin (beta=0.5, margin=400)",
-        strategy_boulware,
-        {"beta": 0.5, "static_margin": 400.0}
-    ),
-    "boulware_firm_margin": StrategySpec(
-        "boulware_firm_margin",
-        "Concedes slowly from margin (beta=2.0, margin=400)",
-        strategy_boulware,
-        {"beta": 2.0, "static_margin": 400.0}
-    ),
-    "boulware_hard_margin": StrategySpec(
-        "boulware_hard_margin",
-        "Concedes very slowly from margin (beta=4.0, margin=400)",
-        strategy_boulware,
-        {"beta": 4.0, "static_margin": 400.0}
-    ),
-    
     # Price Fixed
     "price_fixed_strict": StrategySpec(
         "price_fixed_strict",
@@ -560,28 +583,12 @@ STRATEGY_REGISTRY: Dict[str, StrategySpec] = {
         {}  # No initial_margin = start at ZOPA boundary
     ),
     
-    # Time Dependent - Selfish start (ZOPA boundary)
-    "time_dependent": StrategySpec(
-        "time_dependent",
-        "Acceptance threshold relaxes over time from ZOPA boundary",
-        strategy_time_dependent_threshold,
-        {}  # No margin = start at ZOPA boundary
-    ),
-    
     # Hardliner - Selfish start (ZOPA boundary) - stays strictly within ZOPA
     "hardliner": StrategySpec(
         "hardliner",
         "Hold firm at ZOPA boundary until final round",
         strategy_hardliner,
         {}  # No margin = hold at ZOPA boundary
-    ),
-    
-    # Hardliner with margin (for comparison)
-    "hardliner_margin": StrategySpec(
-        "hardliner_margin",
-        "Hold firm with margin until final round",
-        strategy_hardliner,
-        {"margin": 400.0}
     ),
     
     # Random Oracle
@@ -591,32 +598,38 @@ STRATEGY_REGISTRY: Dict[str, StrategySpec] = {
         strategy_random_in_zopa,
         {}
     ),
-    
-    # MiCRO Strategies
+
+    # MiCRO Strategies (Minimal Concession)
     "micro_fine": StrategySpec(
         "micro_fine",
-        "MiCRO agent with fine grid (step=5.0)",
+        "MiCRO with fine step size (10) - offers from quantized grid",
         strategy_micro,
-        {"step_size": 5.0}
+        {"step_size": 10.0}
     ),
     "micro_moderate": StrategySpec(
         "micro_moderate",
-        "MiCRO agent with moderate grid (step=25.0)",
+        "MiCRO with moderate step size (25) - offers from quantized grid",
         strategy_micro,
         {"step_size": 25.0}
     ),
     "micro_coarse": StrategySpec(
         "micro_coarse",
-        "MiCRO agent with coarse grid (step=100.0)",
+        "MiCRO with coarse step size (50) - offers from quantized grid",
         strategy_micro,
-        {"step_size": 100.0}
+        {"step_size": 50.0}
     ),
 
-    # Bad Strategy - Naive Concession (concedes immediately to terrible position)
+    # Bad Strategies
     "naive_concession": StrategySpec(
         "naive_concession",
-        "Immediately concedes 80% of ZOPA and sticks with it (bad strategy)",
+        "Makes consistently bad offers near own reservation (bad strategy)",
         strategy_naive_concession,
+        {}
+    ),
+    "naive_linear": StrategySpec(
+        "naive_linear",
+        "Linear concession in WRONG direction - gets worse over time (bad strategy)",
+        strategy_naive_linear,
         {}
     )
 }

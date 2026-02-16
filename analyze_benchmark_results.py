@@ -66,10 +66,7 @@ def prepare_data(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     # Filter for agreements only (where utilities are meaningful)
     df_agreements = df[df['agreement'] == True].copy()
-    
-    # Filter out micro strategies
-    df_agreements = df_agreements[~df_agreements['strategy'].str.startswith('micro_')].copy()
-    
+        
     # Janus as Seller: Janus plays seller role
     janus_seller = df_agreements[df_agreements['janus_role'] == 'seller'].copy()
     janus_seller_data = []
@@ -114,7 +111,8 @@ def create_strategy_violin_plots(
     df_seller: pd.DataFrame,
     df_buyer: pd.DataFrame,
     output_dir: str,
-    prefix: str = ""
+    prefix: str = "",
+    model_name: str = "Janus"
 ):
     """
     Create violin plots for each strategy comparing Janus vs opponent utilities.
@@ -156,7 +154,7 @@ def create_strategy_violin_plots(
             
             # Create violin plot
             sns.violinplot(data=data, x='agent', y='norm_utility', ax=ax, palette=['#2ecc71', '#e74c3c'])
-            ax.set_title(f'Janus as Seller vs {strategy}\n(Buyer opponent)', fontsize=11, fontweight='bold')
+            ax.set_title(f'{model_name} as Seller vs {strategy}\n(Buyer opponent)', fontsize=11, fontweight='bold')
             ax.set_xlabel('Agent', fontsize=10)
             ax.set_ylabel('Normalized Utility (% of ZOPA)', fontsize=10)
             ax.set_ylim(0, 1)
@@ -178,7 +176,7 @@ def create_strategy_violin_plots(
             
             # Create violin plot
             sns.violinplot(data=data, x='agent', y='norm_utility', ax=ax, palette=['#2ecc71', '#e74c3c'])
-            ax.set_title(f'Janus as Buyer vs {strategy}\n(Seller opponent)', fontsize=11, fontweight='bold')
+            ax.set_title(f'{model_name} as Buyer vs {strategy}\n(Seller opponent)', fontsize=11, fontweight='bold')
             ax.set_xlabel('Agent', fontsize=10)
             ax.set_ylabel('Normalized Utility (% of ZOPA)', fontsize=10)
             ax.set_ylim(0, 1)
@@ -191,7 +189,7 @@ def create_strategy_violin_plots(
                     ax.text(i, mean_val + 0.05, f'μ={mean_val:.2%}', 
                            ha='center', fontsize=9, fontweight='bold')
         
-        plt.suptitle(f'Utility Distribution: Janus vs {strategy}', fontsize=13, fontweight='bold', y=1.02)
+        plt.suptitle(f'Utility Distribution: {model_name} vs {strategy}', fontsize=13, fontweight='bold', y=1.02)
         plt.tight_layout()
         
         # Save plot
@@ -209,7 +207,8 @@ def create_strategy_violin_plots(
 def create_overall_summary_plot(
     summaries: List[StrategySummary],
     output_dir: str,
-    prefix: str = ""
+    prefix: str = "",
+    model_name: str = "Janus"
 ):
     """Create an overall summary plot comparing all strategies."""
     
@@ -233,7 +232,7 @@ def create_overall_summary_plot(
     janus_norms = [s.avg_janus_norm * 100 for s in summaries]
     bars = ax.bar(x_pos, janus_norms, color='#2ecc71')
     ax.set_ylabel('Normalized Utility (%)')
-    ax.set_title('Janus Average Utility by Strategy')
+    ax.set_title(f'{model_name} Average Utility by Strategy')
     ax.set_xticks(x_pos)
     ax.set_xticklabels(strategies, rotation=45, ha='right', fontsize=8)
     ax.set_ylim(0, 100)
@@ -247,12 +246,12 @@ def create_overall_summary_plot(
     opp_wins = [s.opponent_wins for s in summaries]
     
     width = 0.25
-    ax.bar([x - width for x in x_pos], janus_wins, width, label='Janus Wins', color='#2ecc71')
+    ax.bar([x - width for x in x_pos], janus_wins, width, label=f'{model_name} Wins', color='#2ecc71')
     ax.bar(x_pos, ties, width, label='Ties', color='#f39c12')
     ax.bar([x + width for x in x_pos], opp_wins, width, label='Opponent Wins', color='#e74c3c')
     
     ax.set_ylabel('Count')
-    ax.set_title('Win/Tie/Loss Distribution')
+    ax.set_title(f'{model_name} Win/Tie/Loss Distribution')
     ax.set_xticks(x_pos)
     ax.set_xticklabels(strategies, rotation=45, ha='right', fontsize=8)
     ax.legend()
@@ -266,7 +265,7 @@ def create_overall_summary_plot(
     ax.set_xticks(x_pos)
     ax.set_xticklabels(strategies, rotation=45, ha='right', fontsize=8)
     
-    plt.suptitle('Janus Benchmark Summary - All Strategies', fontsize=14, fontweight='bold')
+    plt.suptitle(f'{model_name} Benchmark Summary - All Strategies', fontsize=14, fontweight='bold')
     plt.tight_layout()
     
     filename = f"{prefix}overall_summary.png" if prefix else "overall_summary.png"
@@ -408,6 +407,16 @@ def main():
         print("No data found!")
         return
     
+    # Detect model name from CSV filename
+    csv_basename = os.path.basename(csv_path).lower()
+    if 'qwen' in csv_basename:
+        model_name = "Qwen"
+    elif 'base' in csv_basename:
+        model_name = "Base Model"
+    else:
+        model_name = "Janus"
+    print(f"Detected model: {model_name}")
+    
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
@@ -418,8 +427,9 @@ def main():
     # Calculate summaries
     print("Calculating summaries...")
     
-    # Filter out micro strategies for summary
-    df_filtered = df[~df['strategy'].str.startswith('micro_')].copy()
+    # Filter out random and price_fixed strategies
+    excluded = ['random_zopa', 'price_fixed_strict', 'price_fixed_loose']
+    df_filtered = df[~df['strategy'].isin(excluded)].copy()
     
     # Group results by strategy for summary
     results_by_strategy: Dict[str, List[Dict]] = {}
@@ -447,11 +457,11 @@ def main():
     
     # Create overall summary plot
     print("\nCreating overall summary plot...")
-    create_overall_summary_plot(summaries, args.output_dir, args.prefix)
+    create_overall_summary_plot(summaries, args.output_dir, args.prefix, model_name)
     
     # Create violin plots for each strategy
     print("\nCreating strategy violin plots...")
-    create_strategy_violin_plots(df_seller, df_buyer, args.output_dir, args.prefix)
+    create_strategy_violin_plots(df_seller, df_buyer, args.output_dir, args.prefix, model_name)
     
     # Print summary table
     print_summary_table(summaries)
