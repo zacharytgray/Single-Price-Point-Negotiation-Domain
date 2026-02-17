@@ -131,6 +131,12 @@ def create_strategy_violin_plots(
     print(f"\nGenerating plots for {len(all_strategies)} strategies...")
     
     for strategy in all_strategies:
+        # Special handling for base_model_opponent comparison
+        if strategy == 'base_model_opponent':
+            print(f"  Creating Janus vs Base Model comparison plots")
+            create_janus_vs_base_comparison_plot(df_seller, df_buyer, strategy, output_dir, prefix, model_name)
+            continue
+            
         print(f"  Creating plots for: {strategy}")
         
         # Create figure with 1 or 2 subplots depending on data availability
@@ -202,6 +208,90 @@ def create_strategy_violin_plots(
         print(f"    Saved: {filepath}")
     
     print(f"\n{Fore.GREEN}All plots saved to: {output_dir}{Fore.RESET}")
+
+
+def create_janus_vs_base_comparison_plot(
+    df_seller: pd.DataFrame,
+    df_buyer: pd.DataFrame,
+    strategy: str,
+    output_dir: str,
+    prefix: str = "",
+    model_name: str = "Janus"
+):
+    """Create a special comparison plot for Janus vs Base Model."""
+    
+    has_seller_data = strategy in set(df_seller['strategy'].unique()) if not df_seller.empty else False
+    has_buyer_data = strategy in set(df_buyer['strategy'].unique()) if not df_buyer.empty else False
+    
+    num_plots = (1 if has_seller_data else 0) + (1 if has_buyer_data else 0)
+    if num_plots == 0:
+        return
+    
+    fig, axes = plt.subplots(1, num_plots, figsize=(7 * num_plots, 6))
+    if num_plots == 1:
+        axes = [axes]
+    
+    plot_idx = 0
+    
+    # Plot 1: Janus as Seller vs Base Model
+    if has_seller_data:
+        data = df_seller[df_seller['strategy'] == strategy].copy()
+        data['agent'] = data['agent'].replace({
+            'Janus (Seller)': 'Janus (Seller)',
+            'Opponent (Buyer)': 'Base Model (Buyer)'
+        })
+        ax = axes[plot_idx]
+        
+        sns.violinplot(data=data, x='agent', y='norm_utility', ax=ax, palette=['#2ecc71', '#3498db'])
+        ax.set_title(f'Janus as Seller vs Base Model\n(Buyer role)', fontsize=11, fontweight='bold')
+        ax.set_xlabel('Agent', fontsize=10)
+        ax.set_ylabel('Normalized Utility (% of ZOPA)', fontsize=10)
+        ax.set_ylim(0, 1)
+        ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, label='Fair split')
+        ax.legend()
+        
+        for i, agent_type in enumerate(['Janus (Seller)', 'Base Model (Buyer)']):
+            agent_data = data[data['agent'] == agent_type]['norm_utility']
+            if not agent_data.empty:
+                mean_val = agent_data.mean()
+                ax.text(i, mean_val + 0.05, f'μ={mean_val:.2%}', 
+                       ha='center', fontsize=9, fontweight='bold')
+        
+        plot_idx += 1
+    
+    # Plot 2: Janus as Buyer vs Base Model
+    if has_buyer_data:
+        data = df_buyer[df_buyer['strategy'] == strategy].copy()
+        data['agent'] = data['agent'].replace({
+            'Janus (Buyer)': 'Janus (Buyer)',
+            'Opponent (Seller)': 'Base Model (Seller)'
+        })
+        ax = axes[plot_idx]
+        
+        sns.violinplot(data=data, x='agent', y='norm_utility', ax=ax, palette=['#2ecc71', '#3498db'])
+        ax.set_title(f'Janus as Buyer vs Base Model\n(Seller role)', fontsize=11, fontweight='bold')
+        ax.set_xlabel('Agent', fontsize=10)
+        ax.set_ylabel('Normalized Utility (% of ZOPA)', fontsize=10)
+        ax.set_ylim(0, 1)
+        ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, label='Fair split')
+        ax.legend()
+        
+        for i, agent_type in enumerate(['Janus (Buyer)', 'Base Model (Seller)']):
+            agent_data = data[data['agent'] == agent_type]['norm_utility']
+            if not agent_data.empty:
+                mean_val = agent_data.mean()
+                ax.text(i, mean_val + 0.05, f'μ={mean_val:.2%}', 
+                       ha='center', fontsize=9, fontweight='bold')
+    
+    plt.suptitle('Janus vs Base Model Direct Comparison', fontsize=13, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    
+    filename = f"{prefix}janus_vs_base_model_comparison.png" if prefix else "janus_vs_base_model_comparison.png"
+    filepath = os.path.join(output_dir, filename)
+    plt.savefig(filepath, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"    Saved: {filepath}")
 
 
 def create_overall_summary_plot(
@@ -338,9 +428,19 @@ def print_summary_table(summaries: List[StrategySummary]):
     total_janus_wins = 0
     total_opponent_wins = 0
     total_ties = 0
+    has_base_comparison = False
     
     for s in summaries:
-        print(f"{s.strategy:<25} {s.total_episodes:>4} {s.agreements:>4} {s.agreement_rate:>6.1f} "
+        # Special display for base model comparison
+        if s.strategy == 'base_model_opponent':
+            has_base_comparison = True
+            strategy_display = 'vs Base Model'
+            opp_pct_label = 'Base%'
+        else:
+            strategy_display = s.strategy
+            opp_pct_label = 'Opp%'
+            
+        print(f"{strategy_display:<25} {s.total_episodes:>4} {s.agreements:>4} {s.agreement_rate:>6.1f} "
               f"{s.avg_janus_norm*100:>6.1f}% {s.avg_opponent_norm*100:>6.1f}% {s.ties:>5} {s.avg_turns:>6.1f}")
         
         total_episodes += s.total_episodes
@@ -361,7 +461,10 @@ def print_summary_table(summaries: List[StrategySummary]):
     print(f"{'OVERALL':<25} {total_episodes:>4} {total_agreements:>4} {overall_agr:>6.1f} "
           f"{overall_janus*100:>6.1f}% {overall_opp*100:>6.1f}% {total_ties:>5}")
     
-    print(f"\n{Fore.GREEN}Janus wins: {total_janus_wins} | Opponent wins: {total_opponent_wins} | Ties: {total_ties}{Fore.RESET}")
+    if has_base_comparison:
+        print(f"\n{Fore.GREEN}Janus wins: {total_janus_wins} | Opponent/Base wins: {total_opponent_wins} | Ties: {total_ties}{Fore.RESET}")
+    else:
+        print(f"\n{Fore.GREEN}Janus wins: {total_janus_wins} | Opponent wins: {total_opponent_wins} | Ties: {total_ties}{Fore.RESET}")
 
 
 def main():

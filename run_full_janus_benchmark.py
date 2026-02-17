@@ -550,7 +550,8 @@ async def benchmark_strategy(
     use_base_model: bool = False,
     model_name: str = "qwen2:7b",
     verbose: bool = False,
-    debug_base_model: bool = False
+    debug_base_model: bool = False,
+    is_base_model_opponent: bool = False
 ) -> List[BenchmarkResult]:
     """Run benchmark for a single strategy."""
     
@@ -582,10 +583,23 @@ async def benchmark_strategy(
         
         # Create opponent
         opponent_role = "seller" if janus_role == "buyer" else "buyer"
-        opponent = DeterministicPriceAgent(
-            agent_id=2 if opponent_role == "seller" else 1,
-            strategy_name=strategy_name
-        )
+        
+        if is_base_model_opponent:
+            # Create base model as opponent for Janus vs Base Model comparison
+            opponent_reservation = seller_min if opponent_role == "seller" else buyer_max
+            opponent = OllamaAgent(
+                model_name=model_name,
+                role=opponent_role,
+                reservation_price=opponent_reservation,
+                max_turns=MAX_TURNS,
+                system_instructions=None,
+                debug=debug_base_model
+            )
+        else:
+            opponent = DeterministicPriceAgent(
+                agent_id=2 if opponent_role == "seller" else 1,
+                strategy_name=strategy_name
+            )
         
         try:
             result = await run_episode(
@@ -607,7 +621,10 @@ async def benchmark_strategy(
             if verbose:
                 print(f"    Episode {ep} error: {e}")
         finally:
-            # Clean up Ollama agent if using base model
+            # Clean up Ollama agent if using base model or base model opponent
+            if use_base_model or is_base_model_opponent:
+                del opponent
+                gc.collect()
             if use_base_model:
                 del janus_agent
                 gc.collect()
@@ -664,6 +681,10 @@ async def main():
     parser.add_argument(
         "--debug_base_model", action="store_true",
         help="Enable detailed per-turn debug logs for base model inference/parsing"
+    )
+    parser.add_argument(
+        "--include_base_comparison", action="store_true",
+        help="Include Janus vs Base Model comparison test (only when testing Janus)"
     )
     args = parser.parse_args()
     
@@ -771,6 +792,38 @@ async def main():
             traceback.print_exc()
             continue
     
+    # Janus vs Base Model Comparison (only for Janus benchmarking)
+    if not args.use_base_model and args.include_base_comparison:
+        print(f"\n{Fore.MAGENTA}{'='*80}")
+        print("JANUS VS BASE MODEL COMPARISON")
+        print(f"{'='*80}{Fore.RESET}")
+        print(f"Running {args.episodes_per_strategy} episodes of Janus vs Base Model...")
+        
+        try:
+            base_comparison_results = await benchmark_strategy(
+                strategy_name="base_model_opponent",
+                episodes=args.episodes_per_strategy,
+                janus_buyer=janus_buyer,
+                janus_seller=janus_seller,
+                logger=logger,
+                use_base_model=False,
+                model_name=args.model_name,
+                verbose=args.verbose,
+                debug_base_model=args.debug_base_model,
+                is_base_model_opponent=True
+            )
+            
+            all_results.extend(base_comparison_results)
+            base_summary = calculate_strategy_summary("base_model_opponent", base_comparison_results)
+            summaries.append(base_summary)
+            
+            print(f"  {Fore.GREEN}Complete:{Fore.RESET} Agr={base_summary.agreement_rate:.1f}% "
+                  f"Janus={base_summary.avg_janus_norm:.2%} Base={base_summary.avg_opponent_norm:.2%}")
+        except Exception as e:
+            print(f"{Fore.RED}  ERROR in base comparison: {e}{Fore.RESET}")
+            import traceback
+            traceback.print_exc()
+    
     total_time = time.time() - start_time
     
     # Print final summary
@@ -785,7 +838,11 @@ async def main():
     print(f"BENCHMARK COMPLETE")
     print(f"{'='*80}{Fore.RESET}")
     print(f"Total time: {total_time/60:.1f} minutes")
-    print(f"Episodes completed: {len(all_results)}/{len(strategies) * args.episodes_per_strategy}")
+    if args.include_base_comparison and not args.use_base_model:
+        total_episodes_expected = (len(strategies) + 1) * args.episodes_per_strategy
+        print(f"Episodes completed: {len(all_results)}/{total_episodes_expected}")
+    else:
+        print(f"Episodes completed: {len(all_results)}/{len(strategies) * args.episodes_per_strategy}")
     print(f"\nResults saved:")
     print(f"  CSV: {logger.get_csv_path()}")
     print(f"  JSON: {logger.get_json_path()}")
