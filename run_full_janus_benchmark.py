@@ -209,7 +209,7 @@ def create_price_state(
 
 async def run_episode(
     janus_agent,
-    opponent: DeterministicPriceAgent,
+    opponent,
     janus_role: str,
     buyer_max: float,
     seller_min: float,
@@ -219,7 +219,8 @@ async def run_episode(
     logger: BenchmarkLogger,
     verbose: bool = False,
     use_base_model: bool = False,
-    debug_base_model: bool = False
+    debug_base_model: bool = False,
+    opponent_is_base_model: bool = False
 ) -> BenchmarkResult:
     """Run a single negotiation episode."""
     
@@ -346,42 +347,76 @@ async def run_episode(
             
         else:
             # Opponent's turn
-            state = create_price_state(
-                timestep=turn,
-                max_turns=MAX_TURNS,
-                role=opponent_role,
-                last_offer=last_offer,
-                history=history,
-                reservation=opponent_reservation,
-                buyer_max=buyer_max,
-                seller_min=seller_min
-            )
-            
-            action = opponent.propose_action(state)
-            
-            if action.type == "OFFER":
-                last_offer = action.price
-                history.append((opponent_role, last_offer))
-                offer_history_log.append({
-                    'turn': turn,
-                    'agent': 'opponent',
-                    'role': opponent_role,
-                    'action': 'OFFER',
-                    'price': last_offer
-                })
-                domain.current_offer = last_offer
-                domain.last_offerer_id = opponent_agent_num
+            if opponent_is_base_model:
+                # Base model opponent uses OllamaAgent's generate_response
+                prompt = opponent.build_prompt(
+                    turn=turn,
+                    last_offer=last_offer,
+                    history=history
+                )
+                response = await opponent.generate_response(input_text_role="user", input_text=prompt)
+                action = domain.parse_agent_action(opponent_agent_num, response)
                 
-            elif action.type == "ACCEPT" and last_offer is not None:
-                agreement_reached = True
-                final_price = last_offer
-                offer_history_log.append({
-                    'turn': turn,
-                    'agent': 'opponent',
-                    'role': opponent_role,
-                    'action': 'ACCEPT',
-                    'price': last_offer
-                })
+                if action.action_type == "OFFER" and action.offer_content is not None:
+                    last_offer = action.offer_content
+                    history.append((opponent_role, last_offer))
+                    offer_history_log.append({
+                        'turn': turn,
+                        'agent': 'opponent',
+                        'role': opponent_role,
+                        'action': 'OFFER',
+                        'price': last_offer
+                    })
+                    domain.current_offer = last_offer
+                    domain.last_offerer_id = opponent_agent_num
+                elif action.action_type == "ACCEPT" and last_offer is not None:
+                    agreement_reached = True
+                    final_price = last_offer
+                    offer_history_log.append({
+                        'turn': turn,
+                        'agent': 'opponent',
+                        'role': opponent_role,
+                        'action': 'ACCEPT',
+                        'price': last_offer
+                    })
+            else:
+                # Deterministic opponent uses propose_action
+                state = create_price_state(
+                    timestep=turn,
+                    max_turns=MAX_TURNS,
+                    role=opponent_role,
+                    last_offer=last_offer,
+                    history=history,
+                    reservation=opponent_reservation,
+                    buyer_max=buyer_max,
+                    seller_min=seller_min
+                )
+                
+                action = opponent.propose_action(state)
+                
+                if action.type == "OFFER":
+                    last_offer = action.price
+                    history.append((opponent_role, last_offer))
+                    offer_history_log.append({
+                        'turn': turn,
+                        'agent': 'opponent',
+                        'role': opponent_role,
+                        'action': 'OFFER',
+                        'price': last_offer
+                    })
+                    domain.current_offer = last_offer
+                    domain.last_offerer_id = opponent_agent_num
+                    
+                elif action.type == "ACCEPT" and last_offer is not None:
+                    agreement_reached = True
+                    final_price = last_offer
+                    offer_history_log.append({
+                        'turn': turn,
+                        'agent': 'opponent',
+                        'role': opponent_role,
+                        'action': 'ACCEPT',
+                        'price': last_offer
+                    })
             
             current_agent = "janus"
     
@@ -614,7 +649,8 @@ async def benchmark_strategy(
                 logger=logger,
                 verbose=verbose,
                 use_base_model=use_base_model,
-                debug_base_model=debug_base_model
+                debug_base_model=debug_base_model,
+                opponent_is_base_model=is_base_model_opponent
             )
             results.append(result)
         except Exception as e:
@@ -715,8 +751,10 @@ async def main():
     if not args.use_base_model:
         print(f"  Janus buyer rho: {buyer_rho}")
         print(f"  Janus seller rho: {seller_rho}")
-    print(f"  Total strategies: {len(strategies)}")
-    print(f"  Total episodes: {len(strategies) * args.episodes_per_strategy}")
+    # Include base comparison in strategy count if enabled
+    total_strategies = len(strategies) + (1 if args.include_base_comparison and not args.use_base_model else 0)
+    print(f"  Total strategies: {total_strategies}")
+    print(f"  Total episodes: {total_strategies * args.episodes_per_strategy}")
     print(f"\nStrategies to test:")
     for i, s in enumerate(strategies, 1):
         print(f"  {i:2}. {s}")
