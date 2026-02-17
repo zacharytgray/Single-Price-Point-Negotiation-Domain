@@ -425,13 +425,22 @@ def strategy_micro(state: PriceState, params: Dict[str, Any]) -> PriceAction:
     
     pub_min, pub_max = state.public_price_range if state.public_price_range else (0.0, 2000.0)
     
-    # Use ZOPA bounds if provided, otherwise use public bounds
-    zopa_low = params.get("zopa_low", pub_min)
-    zopa_high = params.get("zopa_high", pub_max)
+    # Estimate ZOPA bounds from reservation (standard ZOPA width = 500)
+    DEFAULT_ZOPA_WIDTH = 500.0
+    if role == "buyer":
+        # Buyer's reservation is the high end of ZOPA
+        zopa_low = max(pub_min, my_res - DEFAULT_ZOPA_WIDTH)
+        zopa_high = my_res
+    else:
+        # Seller's reservation is the low end of ZOPA
+        zopa_low = my_res
+        zopa_high = min(pub_max, my_res + DEFAULT_ZOPA_WIDTH)
     
     grid = []
-    curr = math.floor(zopa_low)
-    end = math.ceil(zopa_high)
+    # Use ceil for low bound to ensure we don't go below ZOPA
+    # Use floor for high bound to ensure we don't go above ZOPA
+    curr = math.ceil(zopa_low)
+    end = math.floor(zopa_high)
     while curr <= end:
         grid.append(float(curr))
         curr += step_size
