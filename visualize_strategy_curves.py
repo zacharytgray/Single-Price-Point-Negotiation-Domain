@@ -15,7 +15,10 @@ import sys
 # Ensure project root is in path
 sys.path.insert(0, ".")
 
-from src.agents.price_strategies import STRATEGY_REGISTRY, DeterministicPriceAgent
+from src.agents.price_strategies import (
+    STRATEGY_REGISTRY, DeterministicPriceAgent,
+    EXCLUDED_FROM_BENCHMARK, REACTIVE_STRATEGIES, get_benchmark_strategies
+)
 from src.core.price_structures import PriceState, PriceAction
 
 # Configuration
@@ -27,31 +30,15 @@ BUYER_MAX = 1000.0  # Buyer Reservation (willing to pay up to 1000)
 SELLER_MIN = 500.0  # Seller Reservation (willing to sell down to 500)
 # ZOPA is [500, 1000]
 
-OPPONENT_STRATEGY = "boulware_firm" # Standard opponent for reactive strategies
+OPPONENT_STRATEGY = "boulware_firm"  # Standard opponent for reactive strategies
 
-# Categorization
-INDEPENDENT_STRATEGIES = [
-    "boulware_very_conceding",
-    "boulware_conceding",
-    "boulware_firm",
-    "boulware_hard",
-    "linear_standard",
-    "price_fixed_strict",
-    "price_fixed_loose",
-    "hardliner",
-    # Bad strategies
-    "naive_concession",
-    "naive_linear"
-]
-
-REACTIVE_STRATEGIES = [
-    "tit_for_tat",
-    "split_difference",
-    "micro_fine",
-    "micro_moderate",
-    "micro_coarse",
-    "random_zopa" 
-]
+# Strategy lists are derived automatically from the registry.
+# To add a new strategy: register it in price_strategies.STRATEGY_REGISTRY.
+# To exclude it from all scripts: add it to price_strategies.EXCLUDED_FROM_BENCHMARK.
+# To make it reactive (plotted vs opponent): add it to price_strategies.REACTIVE_STRATEGIES.
+all_benchmark = set(get_benchmark_strategies())
+INDEPENDENT_STRATEGIES = sorted(all_benchmark - REACTIVE_STRATEGIES)
+VIZ_REACTIVE_STRATEGIES = sorted(all_benchmark & REACTIVE_STRATEGIES)
 
 
 def simulate_independent_curve(strategy_name: str, role: str) -> list:
@@ -326,15 +313,17 @@ def plot_reactive(strategy_name):
 
 def main():
     print("Generating Strategy Curves...")
-    
+    print(f"  Independent strategies ({len(INDEPENDENT_STRATEGIES)}): {', '.join(INDEPENDENT_STRATEGIES)}")
+    print(f"  Reactive strategies ({len(VIZ_REACTIVE_STRATEGIES)}): {', '.join(VIZ_REACTIVE_STRATEGIES)}")
+
     for strat in INDEPENDENT_STRATEGIES:
         if strat in STRATEGY_REGISTRY:
             plot_independent(strat)
-            
-    for strat in REACTIVE_STRATEGIES:
+
+    for strat in VIZ_REACTIVE_STRATEGIES:
         if strat in STRATEGY_REGISTRY:
             plot_reactive(strat)
-            
+
     print("Done.")
 
 if __name__ == "__main__":

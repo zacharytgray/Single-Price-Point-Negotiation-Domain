@@ -25,6 +25,9 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from colorama import Fore, init
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from src.agents.price_strategies import EXCLUDED_FROM_BENCHMARK
+
 init(autoreset=True)
 
 
@@ -530,9 +533,8 @@ def main():
     # Calculate summaries
     print("Calculating summaries...")
     
-    # Filter out random and price_fixed strategies
-    excluded = ['random_zopa', 'price_fixed_strict', 'price_fixed_loose']
-    df_filtered = df[~df['strategy'].isin(excluded)].copy()
+    # Filter out strategies excluded from benchmarking (e.g. random oracle)
+    df_filtered = df[~df['strategy'].isin(EXCLUDED_FROM_BENCHMARK)].copy()
     
     # Group results by strategy for summary
     results_by_strategy: Dict[str, List[Dict]] = {}

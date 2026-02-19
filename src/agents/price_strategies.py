@@ -63,6 +63,71 @@ def strategy_boulware(state: PriceState, params: Dict[str, Any]) -> PriceAction:
     return PriceAction(type="OFFER", price=round(target_price, 2))
 
 
+def strategy_noisy_boulware(state: PriceState, params: Dict[str, Any]) -> PriceAction:
+    """
+    Noisy Boulware strategy: Boulware concession with bounded randomness.
+    
+    Uses the base boulware calculation but adds slight, bounded random noise to offers.
+    This keeps the opponent guessing while maintaining the overall concession pattern.
+    
+    Parameters:
+        - beta: Concession curve parameter (same as boulware)
+        - noise_max: Maximum absolute noise to add (default: 25.0)
+        - noise_scale: Scale of noise relative to ZOPA width (default: 0.05 = 5%)
+    
+    The noise is bounded to ensure the agent doesn't accidentally make "better" offers
+    than intended (e.g., a buyer offering more than the noisy target).
+    """
+    # Get base boulware target
+    base_result = strategy_boulware(state, params)
+    
+    # If accepting, return as-is
+    if base_result.type == "ACCEPT":
+        return base_result
+    
+    base_price = base_result.price
+    reservation = state.effective_reservation_price
+    role = state.role
+    pub_min, pub_max = state.public_price_range if state.public_price_range else (0.0, 2000.0)
+    
+    # Calculate noise bounds
+    DEFAULT_ZOPA_WIDTH = 500.0
+    noise_max = params.get("noise_max", 25.0)
+    noise_scale = params.get("noise_scale", 0.05)
+    zopa_based_noise = DEFAULT_ZOPA_WIDTH * noise_scale
+    actual_noise_max = min(noise_max, zopa_based_noise)
+    
+    # Generate bounded random noise
+    # For buyers: can offer LESS (lower price is better for buyer) but not MORE than base
+    # For sellers: can offer MORE (higher price is better for seller) but not LESS than base
+    # This ensures noise doesn't hurt the agent's position
+    noise = random.uniform(-actual_noise_max, actual_noise_max)
+    
+    if role == "buyer":
+        # Buyer: base_price is what they're willing to pay (upper bound)
+        # Noise can make them offer slightly less (good) or slightly more (bad, bounded)
+        # Allow going slightly above base (worse for buyer) or below (better for buyer)
+        noisy_price = base_price + noise
+        # Clamp: can't offer more than base + noise_max (worse position)
+        # Can't offer below pub_min (invalid)
+        noisy_price = min(noisy_price, base_price + actual_noise_max)
+        noisy_price = max(noisy_price, pub_min)
+        # Also can't exceed reservation (would be irrational)
+        noisy_price = min(noisy_price, reservation)
+    else:
+        # Seller: base_price is what they're willing to accept (lower bound)
+        # Noise can make them ask slightly more (good) or slightly less (bad, bounded)
+        noisy_price = base_price + noise
+        # Clamp: can't ask less than base - noise_max (worse position)
+        # Can't ask above pub_max (invalid)
+        noisy_price = max(noisy_price, base_price - actual_noise_max)
+        noisy_price = min(noisy_price, pub_max)
+        # Also can't go below reservation (would be irrational)
+        noisy_price = max(noisy_price, reservation)
+    
+    return PriceAction(type="OFFER", price=round(noisy_price, 2))
+
+
 def strategy_price_fixed(state: PriceState, params: Dict[str, Any]) -> PriceAction:
     """
     Fixed Price strategy: Always offers a fixed position inside the ZOPA.
@@ -317,47 +382,43 @@ def strategy_random_in_zopa(state: PriceState, params: Dict[str, Any]) -> PriceA
     return PriceAction(type="OFFER", price=round(offer, 2))
 
 
-def strategy_naive_linear(state: PriceState, params: Dict[str, Any]) -> PriceAction:
+def strategy_naive_boulware(state: PriceState, params: Dict[str, Any]) -> PriceAction:
     """
-    Naive Linear strategy - concedes in the WRONG direction (FLIPPED from normal).
-    
-    Normal linear: buyer starts LOW, goes UP toward reservation (conceding by offering more)
-    Naive linear:  buyer starts HIGH, goes DOWN away from reservation (offering LESS over time!)
-    
-    Normal linear: seller starts HIGH, goes DOWN toward reservation (conceding by accepting less)  
-    Naive linear:  seller starts LOW, goes UP away from reservation (asking for MORE over time!)
-    
-    This is completely backwards - the agent gets progressively MORE aggressive as deadline approaches.
+    Naive Boulware strategy - concedes in the WRONG direction with hardline-then-sudden-drop curve.
+
+    A normal agent starts far from their reservation and concedes TOWARD it over time.
+    This agent does the opposite: starts AT their reservation and moves AWAY from it,
+    making progressively worse offers as the deadline approaches.
+
+    Buyer: starts at reservation (high), drifts DOWN — offering less and less over time.
+    Seller: starts at reservation (low), drifts UP — asking more and more over time.
+
+    Uses beta=3.0 (hardline Boulware) so it stays near reservation for most of the negotiation,
+    then concedes rapidly toward the end. The curve is convex — flat early, steep late.
     """
     reservation = state.effective_reservation_price
     role = state.role
     pub_min, pub_max = state.public_price_range if state.public_price_range else (0.0, 2000.0)
-    
-    # Calculate time fraction
+
     DEFAULT_ZOPA_WIDTH = 500.0
+    beta = params.get("beta", 3.0)  # Hardline Boulware: flat early, steep late
     concession_cap = params.get("concession_cap", 0.95)
     time_frac = min(concession_cap, state.timestep / state.max_turns)
-    
+    # With beta > 1: (t/T)^beta grows slowly at first, then rapidly near the end
+    drift = DEFAULT_ZOPA_WIDTH * (time_frac ** beta)
+
     if role == "buyer":
-        # Buyer starts at reservation (high) and goes DOWN toward pub_min (LOWER offers over time!)
-        # This is backwards - should start low and increase, but we start high and decrease
-        start_price = reservation  # Start at max willingness to pay (terrible opening)
-        end_price = max(pub_min, reservation - DEFAULT_ZOPA_WIDTH * 2)  # Go way below normal ZOPA
-        target_price = start_price - (start_price - end_price) * time_frac  # Move DOWN
-        target_price = max(target_price, pub_min)
-        
-        # Accept if opponent offers something reasonable (we're naive but not stupid)
+        # Buyer starts at reservation and drifts DOWN (worse offers over time)
+        target_price = max(pub_min, reservation - drift)
+
+        # Accept if opponent offers something at or below reservation (we're naive but not irrational)
         if state.last_offer_price is not None and state.last_offer_price <= reservation:
             return PriceAction(type="ACCEPT", price=None)
     else:
-        # Seller starts at reservation (low) and goes UP toward pub_max (HIGHER offers over time!)
-        # This is backwards - should start high and decrease, but we start low and increase
-        start_price = reservation  # Start at min willingness to accept (terrible opening)
-        end_price = min(pub_max, reservation + DEFAULT_ZOPA_WIDTH * 2)  # Go way above normal ZOPA
-        target_price = start_price + (end_price - start_price) * time_frac  # Move UP
-        target_price = min(target_price, pub_max)
-        
-        # Accept if opponent offers something reasonable
+        # Seller starts at reservation and drifts UP (worse offers over time)
+        target_price = min(pub_max, reservation + drift)
+
+        # Accept if opponent offers something at or above reservation
         if state.last_offer_price is not None and state.last_offer_price >= reservation:
             return PriceAction(type="ACCEPT", price=None)
 
@@ -554,18 +615,24 @@ STRATEGY_REGISTRY: Dict[str, StrategySpec] = {
         {"beta": 4.0}  # No static_margin = start at public bounds (selfish)
     ),
     
-    # Price Fixed
-    "price_fixed_strict": StrategySpec(
-        "price_fixed_strict",
-        "Offers exactly reservation +/- small margin",
-        strategy_price_fixed,
-        {"margin": 20.0}
+    # Noisy Boulware - Same concession curves with bounded randomness
+    "noisy_boulware_conceding": StrategySpec(
+        "noisy_boulware_conceding",
+        "Boulware (beta=0.5) with ±5% ZOPA random noise to keep opponent guessing",
+        strategy_noisy_boulware,
+        {"beta": 0.5, "noise_max": 25.0, "noise_scale": 0.05}
     ),
-    "price_fixed_loose": StrategySpec(
-        "price_fixed_loose",
-        "Offers reservation +/- large margin",
-        strategy_price_fixed,
-        {"margin": 100.0}
+    "noisy_boulware_firm": StrategySpec(
+        "noisy_boulware_firm",
+        "Boulware (beta=2.0) with ±5% ZOPA random noise to keep opponent guessing",
+        strategy_noisy_boulware,
+        {"beta": 2.0, "noise_max": 25.0, "noise_scale": 0.05}
+    ),
+    "noisy_boulware_hard": StrategySpec(
+        "noisy_boulware_hard",
+        "Boulware (beta=4.0) with ±5% ZOPA random noise to keep opponent guessing",
+        strategy_noisy_boulware,
+        {"beta": 4.0, "noise_max": 25.0, "noise_scale": 0.05}
     ),
 
     # Tit for Tat - Selfish start (no margin)
@@ -635,12 +702,45 @@ STRATEGY_REGISTRY: Dict[str, StrategySpec] = {
         strategy_naive_concession,
         {}
     ),
-    "naive_linear": StrategySpec(
-        "naive_linear",
-        "Linear concession in WRONG direction - gets worse over time (bad strategy)",
-        strategy_naive_linear,
-        {}
+    "naive_boulware": StrategySpec(
+        "naive_boulware",
+        "Naive Boulware - concedes in WRONG direction, hardline then sudden drop (bad strategy)",
+        strategy_naive_boulware,
+        {"beta": 3.0}  # Hardline: flat early, steep late
     )
+}
+
+
+# --- Strategy List Helpers ---
+
+# Strategies excluded from benchmarking and visualization.
+# Add any strategy name here to exclude it from all scripts automatically.
+EXCLUDED_FROM_BENCHMARK: set = {
+    "random_zopa",  # Oracle strategy - requires known ZOPA bounds
+}
+
+
+def get_benchmark_strategies() -> List[str]:
+    """Return sorted list of all strategies suitable for benchmarking.
+    
+    Automatically includes every strategy in STRATEGY_REGISTRY except those
+    in EXCLUDED_FROM_BENCHMARK. Add new strategies to the registry and they
+    will appear here automatically.
+    """
+    return sorted(STRATEGY_REGISTRY.keys() - EXCLUDED_FROM_BENCHMARK)
+
+
+# Strategies that are reactive (depend on opponent offers) vs independent.
+# Used by visualize_strategy_curves.py to choose the right plot type.
+# Independent strategies are plotted solo; reactive strategies are plotted
+# against a standard Boulware opponent.
+REACTIVE_STRATEGIES: set = {
+    "tit_for_tat",
+    "split_difference",
+    "micro_fine",
+    "micro_moderate",
+    "micro_coarse",
+    "random_zopa",
 }
 
 

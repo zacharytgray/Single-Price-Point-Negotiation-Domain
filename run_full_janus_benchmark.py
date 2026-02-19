@@ -39,7 +39,10 @@ from config.settings import (
     JANUS_ADAPTER_PATH,
     JANUS_MODEL_PATH
 )
-from src.agents.price_strategies import STRATEGY_REGISTRY, DeterministicPriceAgent
+from src.agents.price_strategies import (
+    STRATEGY_REGISTRY, DeterministicPriceAgent,
+    EXCLUDED_FROM_BENCHMARK, get_benchmark_strategies
+)
 from src.agents.ollama_agent import OllamaAgent
 
 # JanusAgent imported conditionally when not using base model
@@ -52,19 +55,8 @@ from src.domain.single_issue_price_domain import SingleIssuePriceDomain
 DEFAULT_EPISODES_PER_STRATEGY = 50
 LOG_DIR = "logs"
 
-# Strategies to exclude from benchmarking
-EXCLUDED_STRATEGIES = {
-    'random_zopa',  # Random strategy (oracle)
-    # Price fixed strategies (not realistic for benchmarking)
-    'price_fixed_strict',
-    'price_fixed_loose',
-}
-
-
-def get_benchmark_strategies() -> List[str]:
-    """Get list of unique deterministic strategies for benchmarking."""
-    all_strategies = set(STRATEGY_REGISTRY.keys())
-    return sorted(list(all_strategies - EXCLUDED_STRATEGIES))
+# get_benchmark_strategies() is imported from price_strategies.
+# To exclude a strategy from all benchmarks, add it to EXCLUDED_FROM_BENCHMARK there.
 
 
 @dataclass
@@ -146,7 +138,7 @@ class BenchmarkLogger:
                 result.timestamp, result.offer_history
             ])
     
-    def save_summary(self, summaries: List[StrategySummary]):
+    def save_summary(self, summaries: List[StrategySummary], buyer_rho: Optional[float] = None, seller_rho: Optional[float] = None):
         """Save summary statistics to JSON."""
         summary_data = {
             'session_id': self.session_id,
@@ -155,6 +147,8 @@ class BenchmarkLogger:
             'strategies_tested': len(summaries),
             'janus_adapter_path': JANUS_ADAPTER_PATH,
             'janus_model_path': JANUS_MODEL_PATH,
+            'buyer_rho': buyer_rho,
+            'seller_rho': seller_rho,
             'strategy_summaries': [
                 {
                     'strategy': s.strategy,
@@ -760,11 +754,15 @@ async def main():
         print(f"  {i:2}. {s}")
     print()
     
-    # Initialize logger
+    # Initialize logger with descriptive session name
     if args.use_base_model:
-        logger = BenchmarkLogger(f"base_{args.model_name.replace(':', '_')}_benchmark")
+        session_name = f"Base_{args.model_name.replace(':', '_')}_Benchmark"
     else:
-        logger = BenchmarkLogger("janus_full_benchmark")
+        if args.janus_rho is not None:
+            session_name = f"Janus_rho{args.janus_rho}_Benchmark"
+        else:
+            session_name = f"Janus_B{buyer_rho}_S{seller_rho}_Benchmark"
+    logger = BenchmarkLogger(session_name)
     print(f"{Fore.GREEN}Logging to: {logger.get_csv_path()}{Fore.RESET}\n")
     
     # Create agents
@@ -868,8 +866,11 @@ async def main():
     agent_label = "Base" if args.use_base_model else "Janus"
     print_summary_table(summaries, agent_label=agent_label)
     
-    # Save summary
-    logger.save_summary(summaries)
+    # Save summary (include rho values for Janus models)
+    if args.use_base_model:
+        logger.save_summary(summaries)
+    else:
+        logger.save_summary(summaries, buyer_rho=buyer_rho, seller_rho=seller_rho)
     
     # Final output
     print(f"\n{Fore.MAGENTA}{'='*80}")
