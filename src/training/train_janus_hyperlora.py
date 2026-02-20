@@ -427,6 +427,108 @@ def compute_gate_separation_loss(
 
 
 # ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+def run_evaluation(model, eval_loader, device) -> Dict[str, Any]:
+    """Run evaluation and return a dict of metrics.
+
+    Metrics returned:
+    - eval_loss          : mean cross-entropy over all eval steps
+    - eval_loss_success  : mean loss on success rows (rho != -1)
+    - eval_loss_failure  : mean loss on failure rows (rho == -1)
+    - eval_perplexity    : exp(eval_loss)
+    - rho_bucket_losses  : mean loss per 0.1-wide rho bucket [0,1]
+    - n_batches          : number of batches evaluated
+    """
+    model.eval()
+    total_loss = 0.0
+    success_loss = 0.0
+    failure_loss = 0.0
+    n_success = 0
+    n_failure = 0
+    n_batches = 0
+
+    # rho buckets: 0.0-0.1, 0.1-0.2, ..., 0.9-1.0
+    bucket_loss = [0.0] * 10
+    bucket_count = [0] * 10
+
+    with torch.no_grad():
+        for batch in eval_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
+            rhos = batch["rho"].to(device)  # shape (B, 1)
+
+            model.current_rho = rhos
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            loss_val = outputs.loss.item()
+
+            total_loss += loss_val
+            n_batches += 1
+
+            # Per-row breakdown requires per-token losses; approximate with
+            # batch-level loss split by rho mask.
+            rho_flat = rhos.view(-1)
+            fail_mask = rho_flat < -0.99
+            succ_mask = ~fail_mask
+
+            if succ_mask.any():
+                success_loss += loss_val
+                n_success += 1
+            if fail_mask.any():
+                failure_loss += loss_val
+                n_failure += 1
+
+            # Rho bucket accumulation (success rows only)
+            for rho_val in rho_flat[succ_mask].cpu().tolist():
+                b = min(int(rho_val * 10), 9)
+                bucket_loss[b] += loss_val
+                bucket_count[b] += 1
+
+    model.train()
+
+    avg_loss = total_loss / max(n_batches, 1)
+    avg_success = success_loss / max(n_success, 1)
+    avg_failure = failure_loss / max(n_failure, 1)
+
+    rho_bucket_losses = {}
+    for i in range(10):
+        label = f"{i/10:.1f}-{(i+1)/10:.1f}"
+        rho_bucket_losses[label] = round(bucket_loss[i] / max(bucket_count[i], 1), 6)
+
+    return {
+        "eval_loss": round(avg_loss, 6),
+        "eval_loss_success": round(avg_success, 6),
+        "eval_loss_failure": round(avg_failure, 6),
+        "eval_perplexity": round(float(np.exp(min(avg_loss, 20))), 4),
+        "rho_bucket_losses": rho_bucket_losses,
+        "n_batches": n_batches,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Training log
+# ---------------------------------------------------------------------------
+def load_training_log(output_dir: str) -> Dict[str, Any]:
+    """Load existing training_log.json or return a fresh structure."""
+    path = os.path.join(output_dir, "training_log.json")
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return {"checkpoints": [], "final": None}
+
+
+def save_training_log(output_dir: str, log: Dict[str, Any]):
+    """Persist training_log.json atomically."""
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, "training_log.json")
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(log, f, indent=2)
+    os.replace(tmp_path, path)
+
+
+# ---------------------------------------------------------------------------
 # Save / utils
 # ---------------------------------------------------------------------------
 def save_hyperlora_adapter(model, output_dir, tokenizer, args):
@@ -565,12 +667,20 @@ def train():
         optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=args.max_steps
     )
 
+    # --- training log ------------------------------------------------------
+    os.makedirs(args.output_dir, exist_ok=True)
+    training_log = load_training_log(args.output_dir)
+
     # --- training loop -----------------------------------------------------
     logger.info("Starting Training...")
     global_step = 0
     model.train()
     progress_bar = tqdm(total=args.max_steps, desc="Training")
     epoch = 0
+
+    # Rolling window of recent train losses for train/eval gap tracking
+    recent_train_losses: List[float] = []
+    TRAIN_WINDOW = 100  # steps
 
     while global_step < args.max_steps:
         epoch += 1
@@ -608,17 +718,90 @@ def train():
 
                 global_step += 1
                 progress_bar.update(1)
-                progress_bar.set_postfix(loss=lm_loss.item() * args.grad_accum)
+
+                train_loss_now = lm_loss.item() * args.grad_accum
+                recent_train_losses.append(train_loss_now)
+                if len(recent_train_losses) > TRAIN_WINDOW:
+                    recent_train_losses.pop(0)
+
+                progress_bar.set_postfix(loss=train_loss_now)
 
                 if global_step % args.save_every == 0:
                     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                     save_hyperlora_adapter(model, save_path, tokenizer, args)
+
+                    # --- evaluate and log ----------------------------------
+                    checkpoint_entry: Dict[str, Any] = {
+                        "step": global_step,
+                        "checkpoint": f"checkpoint-{global_step}",
+                        "train_loss_last": round(train_loss_now, 6),
+                        "train_loss_window_mean": round(float(np.mean(recent_train_losses)), 6),
+                        "train_loss_window_std": round(float(np.std(recent_train_losses)), 6),
+                        "epoch": epoch,
+                        "lr": scheduler.get_last_lr()[0] if hasattr(scheduler, "get_last_lr") else None,
+                    }
+
+                    if eval_loader is not None:
+                        logger.info("Running evaluation at step %d...", global_step)
+                        eval_metrics = run_evaluation(model, eval_loader, model.device)
+                        checkpoint_entry["eval"] = eval_metrics
+
+                        # Train/eval gap (overfitting signal)
+                        gap = eval_metrics["eval_loss"] - checkpoint_entry["train_loss_window_mean"]
+                        checkpoint_entry["train_eval_gap"] = round(gap, 6)
+
+                        logger.info(
+                            "Step %d | train_loss=%.4f | eval_loss=%.4f | gap=%.4f | eval_ppl=%.2f",
+                            global_step,
+                            checkpoint_entry["train_loss_window_mean"],
+                            eval_metrics["eval_loss"],
+                            gap,
+                            eval_metrics["eval_perplexity"],
+                        )
+                    else:
+                        checkpoint_entry["eval"] = None
+                        checkpoint_entry["train_eval_gap"] = None
+
+                    training_log["checkpoints"].append(checkpoint_entry)
+                    save_training_log(args.output_dir, training_log)
 
                 if global_step >= args.max_steps:
                     break
 
     logger.info("Training Complete.")
     save_hyperlora_adapter(model, os.path.join(args.output_dir, "final"), tokenizer, args)
+
+    # --- final eval and log entry -----------------------------------------
+    final_entry: Dict[str, Any] = {
+        "step": global_step,
+        "checkpoint": "final",
+        "train_loss_last": round(recent_train_losses[-1], 6) if recent_train_losses else None,
+        "train_loss_window_mean": round(float(np.mean(recent_train_losses)), 6) if recent_train_losses else None,
+        "train_loss_window_std": round(float(np.std(recent_train_losses)), 6) if recent_train_losses else None,
+        "epoch": epoch,
+        "lr": scheduler.get_last_lr()[0] if hasattr(scheduler, "get_last_lr") else None,
+    }
+
+    if eval_loader is not None:
+        logger.info("Running final evaluation...")
+        eval_metrics = run_evaluation(model, eval_loader, model.device)
+        final_entry["eval"] = eval_metrics
+        gap = eval_metrics["eval_loss"] - (final_entry["train_loss_window_mean"] or 0.0)
+        final_entry["train_eval_gap"] = round(gap, 6)
+        logger.info(
+            "Final | train_loss=%.4f | eval_loss=%.4f | gap=%.4f | eval_ppl=%.2f",
+            final_entry["train_loss_window_mean"],
+            eval_metrics["eval_loss"],
+            gap,
+            eval_metrics["eval_perplexity"],
+        )
+    else:
+        final_entry["eval"] = None
+        final_entry["train_eval_gap"] = None
+
+    training_log["final"] = final_entry
+    save_training_log(args.output_dir, training_log)
+    logger.info("Training log saved to %s", os.path.join(args.output_dir, "training_log.json"))
 
 
 if __name__ == "__main__":
