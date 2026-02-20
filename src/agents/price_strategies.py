@@ -402,6 +402,452 @@ def strategy_random_in_zopa(state: PriceState, params: Dict[str, Any]) -> PriceA
     return PriceAction(type="OFFER", price=round(offer, 2))
 
 
+def strategy_fair(state: PriceState, params: Dict[str, Any]) -> PriceAction:
+    """
+    Fair / Equitable strategy.
+
+    Targets the midpoint of the ZOPA (equal utility split for both parties) and
+    converges toward it linearly over the negotiation. On each turn it proposes
+    the price that would give both buyer and seller exactly equal shares of the
+    surplus, then relaxes toward that target as the deadline approaches.
+
+    Acceptance rule: accept any offer that is at least as good as the current
+    fair-target (i.e. the opponent is already offering a fair or better deal).
+
+    Parameters:
+        convergence_rate (float): How quickly to move toward the midpoint.
+            0.0 = open at ZOPA boundary and never move (like hardliner).
+            1.0 = open directly at the midpoint on turn 1 (default: 0.8).
+        noise (float): Optional small random jitter around the fair price
+            to avoid being perfectly predictable (default: 0.0).
+    """
+    role = state.role
+    reservation = state.effective_reservation_price
+    pub_min, pub_max = state.public_price_range if state.public_price_range else (0.0, 2000.0)
+
+    DEFAULT_ZOPA_WIDTH = 500.0
+
+    # Estimate the ZOPA midpoint (equal-utility price) from own reservation.
+    # Buyer's reservation = buyer_max  -> midpoint = buyer_max - ZOPA_WIDTH/2
+    # Seller's reservation = seller_min -> midpoint = seller_min + ZOPA_WIDTH/2
+    # Both expressions yield the same price when ZOPA_WIDTH is fixed.
+    zopa_width = params.get("zopa_width", DEFAULT_ZOPA_WIDTH)
+    fair_price = reservation + (zopa_width / 2.0) if role == "seller" else reservation - (zopa_width / 2.0)
+    fair_price = max(pub_min, min(pub_max, fair_price))
+
+    # Selfish starting anchor: ZOPA boundary (opponent's reservation estimate)
+    if role == "buyer":
+        selfish_start = max(pub_min, reservation - zopa_width)
+    else:
+        selfish_start = min(pub_max, reservation + zopa_width)
+
+    # Convergence: interpolate from selfish_start toward fair_price over time.
+    # convergence_rate=1.0 means we open at fair_price immediately.
+    convergence_rate = params.get("convergence_rate", 0.8)
+    time_frac = min(1.0, state.timestep / state.max_turns)
+    blend = min(1.0, convergence_rate + time_frac * (1.0 - convergence_rate))
+    target = selfish_start + blend * (fair_price - selfish_start)
+
+    # Clamp to own reservation (never offer beyond own limit)
+    if role == "buyer":
+        target = min(target, reservation)
+    else:
+        target = max(target, reservation)
+
+    # Optional jitter
+    noise_amt = params.get("noise", 0.0)
+    if noise_amt > 0.0:
+        target += random.uniform(-noise_amt, noise_amt)
+        target = max(pub_min, min(pub_max, target))
+        if role == "buyer":
+            target = min(target, reservation)
+        else:
+            target = max(target, reservation)
+
+    # Accept if the opponent's offer is at least as fair as the ZOPA midpoint.
+    # We accept anything at or better than fair_price regardless of where we are
+    # in our convergence curve — there's no reason to reject an already-fair deal.
+    # We also accept anything better than our current (possibly more selfish) target.
+    if state.last_offer_price is not None:
+        if role == "buyer" and (state.last_offer_price <= fair_price or state.last_offer_price <= target):
+            return PriceAction(type="ACCEPT", price=None)
+        if role == "seller" and (state.last_offer_price >= fair_price or state.last_offer_price >= target):
+            return PriceAction(type="ACCEPT", price=None)
+
+    return PriceAction(type="OFFER", price=round(target, 2))
+
+
+# ---------------------------------------------------------------------------
+# ChargingBoul — Adaptive opponent-modelling strategy
+# ---------------------------------------------------------------------------
+
+# Persistent cross-round memory keyed by opponent_id.
+# Each entry: {"opp_offers": List[float], "ubi": int, "aui": int,
+#              "classification": str, "best_received_utility": float}
+charging_boul_memory: Dict[str, Dict] = {}
+
+
+def calculate_ubi(received_prices: List[float]) -> int:
+    """
+    Unique Bid Index (UBI).
+
+    Recursively splits the opponent's offer list in half.  If the right half
+    contains *more* unique prices than the left half the opponent is still
+    exploring new territory late in the negotiation — increment UBI and recurse
+    on the right half.  Stop as soon as the right half is no longer more
+    diverse.
+
+    A high UBI (≥ 5) indicates a Boulwarish opponent who delays real concessions
+    until late in the game.
+    """
+    def _recurse(prices: List[float]) -> int:
+        if len(prices) < 2:
+            return 0
+        mid = len(prices) // 2
+        left, right = prices[:mid], prices[mid:]
+        if len(set(right)) > len(set(left)):
+            return 1 + _recurse(right)
+        return 0
+
+    return _recurse(received_prices)
+
+
+def calculate_aui(received_prices: List[float], state: PriceState) -> int:
+    """
+    Average Utility Index (AUI).
+
+    Converts each opponent offer into *our* utility, then recursively checks
+    whether the right half of the utility sequence has a higher mean than the
+    left half.  Each time it does, AUI is incremented and we recurse on the
+    right half.
+
+    A high AUI means the opponent is genuinely conceding (improving our
+    utility) over time — i.e. a Conceder.  A low AUI (≤ 2) means they are
+    not conceding — i.e. a Hardliner.
+    """
+    reservation = state.effective_reservation_price
+    role = state.role
+
+    def price_to_our_utility(price: float) -> float:
+        if role == "buyer":
+            return reservation - price   # lower price → higher utility for buyer
+        else:
+            return price - reservation   # higher price → higher utility for seller
+
+    utilities = [price_to_our_utility(p) for p in received_prices]
+
+    def _recurse(utils: List[float]) -> int:
+        if len(utils) < 2:
+            return 0
+        mid = len(utils) // 2
+        left, right = utils[:mid], utils[mid:]
+        if (sum(right) / len(right)) > (sum(left) / len(left)):
+            return 1 + _recurse(right)
+        return 0
+
+    return _recurse(utilities)
+
+
+def _cb_classify(ubi: int, aui: int) -> str:
+    """Return 'boulwarish', 'hardliner', or 'conceder'."""
+    if ubi >= 5:
+        return "boulwarish"
+    if aui <= 2:
+        return "hardliner"
+    return "conceder"
+
+
+def strategy_charging_boul(state: PriceState, params: Dict[str, Any]) -> PriceAction:
+    """
+    ChargingBoul — Faithful scalar-domain adaptation of Shymanski (2025).
+
+    Reference: "ChargingBoul: A Competitive Negotiating Agent with Novel
+    Opponent Modeling", arXiv:2512.06595.
+
+    The paper operates in normalised utility space [0, 1].  In our scalar
+    price domain, utility maps directly to price via the reservation price:
+
+        buyer  utility = (reservation − price) / ZOPA_WIDTH   ∈ [0, 1]
+        seller utility = (price − reservation) / ZOPA_WIDTH   ∈ [0, 1]
+
+    So a utility target g_t ∈ [0,1] converts to a price target as:
+
+        buyer  target_price = reservation − g_t * ZOPA_WIDTH
+        seller target_price = reservation + g_t * ZOPA_WIDTH
+
+    This keeps all bids inside the ZOPA (between reservation prices).
+
+    ── Concession curve (paper Eq. 1) ──────────────────────────────────
+        g(t) = m + (1 − m)(1 − t^(1/E))
+
+    where:
+        t = timestep / max_turns  ∈ (0, 1]
+        m = minimum acceptable utility (default 0.5)
+        E = concession rate (default 0.1; smaller = later concessions)
+
+    At t=0: g=1 (maximum utility — most selfish bid)
+    At t=1: g=m (minimum utility floor)
+
+    Note: with E=0.1 the exponent 1/E=10 makes the curve very flat early
+    and steep late — this is intentional Boulware behaviour per the paper.
+
+    ── Opponent adaptation (paper Eq. 3) ────────────────────────────────
+    Against a Boulwarish opponent (UBI ≥ 5):
+        E = 0.2 × 2^(5 − ubi)
+    This mirrors the opponent's lateness so neither side is exploited.
+
+    Against a Conceder: m lowered to 0.4 (paper §3.2.1).
+    Against a Hardliner: no change (paper §3.2.2).
+
+    ── Bid window (paper Eq. 2) ─────────────────────────────────────────
+        [g(t) − (3t+1)ε,  g(t) + (3t+1)ε]   in utility space
+    Converted to price space and clamped to [reservation, ZOPA boundary].
+
+    ── Late-round logic (paper §3.2.2, Eq. 4) ───────────────────────────
+    Late period: t > 1 − 0.5^ubi
+    Against Boulwarish: lower m to 0.3; re-propose best received bid if
+    its utility > m and predicted opponent utility < 2m.
+
+    ── Acceptance (paper §3.3) ──────────────────────────────────────────
+    Generate a candidate bid first.  Accept iff received offer is better
+    than the generated bid (and within reservation).
+
+    Parameters (all optional, passed via params dict):
+        opponent_id  (str)   : key for persistent memory (default "default").
+        m_default    (float) : minimum utility floor (default 0.5, per paper).
+        E_default    (float) : concession rate — smaller = more Boulwarish.
+                               Paper used 0.1 for 50-round games; use 0.4 for
+                               20-turn games to get an equivalent visible curve.
+        epsilon      (float) : bid-window tolerance as utility fraction (default 0.02).
+        zopa_width   (float) : ZOPA width for utility↔price conversion (default 500).
+    """
+    role        = state.role
+    reservation = state.effective_reservation_price
+    pub_min, pub_max = state.public_price_range if state.public_price_range else (0.0, 2000.0)
+
+    # ZOPA width used for utility ↔ price conversion.
+    # Utility 1.0 = capturing the full ZOPA; utility 0.0 = at own reservation.
+    ZOPA_WIDTH: float = params.get("zopa_width", 500.0)
+
+    # ------------------------------------------------------------------ #
+    # 1. Update persistent opponent memory                                #
+    # ------------------------------------------------------------------ #
+    opponent_id: str = params.get("opponent_id", "default")
+
+    if opponent_id not in charging_boul_memory:
+        charging_boul_memory[opponent_id] = {
+            "opp_offers": [],
+            "ubi": 0,
+            "aui": 0,
+            "classification": "conceder",   # optimistic default until we have data
+            "best_received_utility": -float("inf"),
+        }
+
+    mem = charging_boul_memory[opponent_id]
+
+    # Collect opponent offers from this episode's history
+    opp_role = "seller" if role == "buyer" else "buyer"
+    mem["opp_offers"] = [p for r, p in state.offer_history if r == opp_role]
+
+    # Recompute indices once we have at least 4 opponent offers
+    if len(mem["opp_offers"]) >= 4:
+        mem["ubi"] = calculate_ubi(mem["opp_offers"])
+        mem["aui"] = calculate_aui(mem["opp_offers"], state)
+        mem["classification"] = _cb_classify(mem["ubi"], mem["aui"])
+
+    # Track the best (most favourable) utility received from the opponent
+    if state.last_offer_price is not None:
+        received_util = (
+            (reservation - state.last_offer_price) / ZOPA_WIDTH if role == "buyer"
+            else (state.last_offer_price - reservation) / ZOPA_WIDTH
+        )
+        if received_util > mem["best_received_utility"]:
+            mem["best_received_utility"] = received_util
+            mem["best_received_price"]   = state.last_offer_price
+
+    # ------------------------------------------------------------------ #
+    # 2. Concession curve parameters (paper §3.2.1)                       #
+    # ------------------------------------------------------------------ #
+    classification = mem["classification"]
+    ubi            = mem["ubi"]
+
+    m_default: float = params.get("m_default", 0.5)   # paper default: 0.5
+    E_default: float = params.get("E_default", 0.1)   # paper default: 0.1 (calibrated for 50 rounds)
+
+    m = m_default
+    E = E_default
+
+    # E controls the concession curve shape via exponent 1/E:
+    #   Small E (e.g. 0.1) → exponent 10 → very flat early, steep at deadline (Boulwarish).
+    #   Large E (e.g. 1.0) → exponent 1  → linear concession.
+    # The paper used E=0.1 for 50-round competitions; for 20-turn games E=0.4
+    # produces an equivalent Boulwarish shape (slow early, visible mid-game movement).
+    E = E_default
+
+    if classification == "conceder":
+        m = 0.4   # paper §3.2.1: lower m against conceder to ensure agreement
+        E = min(E * 2.0, 1.0)   # concede faster against a conceder
+    elif classification == "boulwarish":
+        # Paper Eq. 3: mirror the opponent's lateness with a smaller E.
+        # Smaller E → larger exponent → curve stays high longer.
+        E_boul = 0.2 * (2 ** (5 - ubi))
+        E = max(0.01, min(E_boul, E))   # never concede faster than default
+    # hardliner: keep defaults (paper §3.2.2 — no special concession)
+
+    # ------------------------------------------------------------------ #
+    # 3. Time fraction and concession curve g(t) (paper Eq. 1)            #
+    # ------------------------------------------------------------------ #
+    t = state.timestep / state.max_turns   # ∈ (0, 1]
+    t = min(t, 0.9999)                     # avoid t=1 numerical edge
+
+    # g(t) = m + (1 − m)(1 − t^(1/E))
+    # Exponent 1/E: larger = more Boulwarish (flatter early, steeper late).
+    # E=0.4 → exponent 2.5: visibly Boulwarish over 20 turns.
+    # E=0.1 → exponent 10:  nearly flat for 18/20 turns (paper's 50-round calibration).
+    g_t = m + (1.0 - m) * (1.0 - t ** (1.0 / E))
+    g_t = max(m, min(1.0, g_t))
+
+    # ------------------------------------------------------------------ #
+    # 4. Late-round concession logic (paper §3.2.2, Eq. 4)                #
+    # ------------------------------------------------------------------ #
+    # Paper Eq. 4: late period when t > 1 − 0.5/max(ubi, 1)
+    # (The paper writes "1 - .5^ubi" but the intent from Fig. 3 is that
+    # ubi=5 triggers the late period at t≈0.5, matching 0.5/5=0.1 from end.)
+    late_threshold = 1.0 - 0.5 / max(ubi, 1)
+    in_late_period = t > late_threshold
+
+    if in_late_period and classification == "boulwarish":
+        m_late = 0.3   # paper: lower m to 0.3 in late period
+        g_t    = max(m_late, g_t)
+        best_util = mem.get("best_received_utility", -float("inf"))
+        # Re-propose best received bid if its utility > m_late (paper §3.2.2)
+        if best_util > m_late and "best_received_price" in mem:
+            candidate_price = mem["best_received_price"]
+            if role == "buyer" and candidate_price <= reservation:
+                if state.last_offer_price is not None and state.last_offer_price <= candidate_price:
+                    return PriceAction(type="ACCEPT", price=None)
+                return PriceAction(type="OFFER", price=round(candidate_price, 2))
+            elif role == "seller" and candidate_price >= reservation:
+                if state.last_offer_price is not None and state.last_offer_price >= candidate_price:
+                    return PriceAction(type="ACCEPT", price=None)
+                return PriceAction(type="OFFER", price=round(candidate_price, 2))
+
+    # ------------------------------------------------------------------ #
+    # 5. Convert utility target g(t) to a price                           #
+    # ------------------------------------------------------------------ #
+    # The paper's utility function: u(price) ∈ [0,1] where
+    #   u=1 → own reservation (best possible outcome for self)
+    #   u=0 → opponent's reservation / ZOPA boundary (worst acceptable)
+    #
+    # g(t) starts at 1 (most selfish) and declines to m (minimum floor).
+    # So g(t)=1 → offer at own reservation; g(t)=0 → offer at ZOPA boundary.
+    #
+    # In our scalar domain, inverting the utility function:
+    #   buyer  utility = (reservation − price) / ZOPA_WIDTH
+    #   → price = reservation − u * ZOPA_WIDTH
+    #   g(t)=1 → price = reservation − ZOPA_WIDTH  (= ZOPA boundary, most selfish opening)
+    #   g(t)=m → price = reservation − m * ZOPA_WIDTH  (= minimum concession floor)
+    #
+    # Wait — that maps g=1 to the ZOPA boundary (lowest price for buyer),
+    # which IS the most selfish opening bid (buyer wants low prices).
+    # And g=m maps to reservation − m*ZOPA_WIDTH, which is closer to reservation.
+    # So the concession goes from ZOPA_boundary → toward reservation as g decreases.
+    # This is correct: buyer opens at ZOPA boundary and concedes toward reservation.
+    #
+    # The issue was that with m=0.5, the buyer only ever reaches the midpoint
+    # (reservation − 0.5*ZOPA = midpoint), never going above it. That's intentional:
+    # m is the minimum utility the agent will accept.
+    #
+    # The flatness problem: g(t) barely changes from 1.0 for the first 80% of turns.
+    # Solution: use (1 − g(t)) as the concession fraction so that:
+    #   t=0 → concession=0 → price at ZOPA boundary (most selfish)
+    #   t=1 → concession=(1−m) → price at reservation − m*ZOPA (minimum floor)
+    #
+    # concession_frac = 1 − g(t)  ∈ [0, 1−m]
+    # buyer  target = zopa_boundary + concession_frac * ZOPA_WIDTH
+    #               = (reservation − ZOPA_WIDTH) + (1−g_t) * ZOPA_WIDTH
+    # seller target = zopa_boundary − concession_frac * ZOPA_WIDTH
+    #               = (reservation + ZOPA_WIDTH) − (1−g_t) * ZOPA_WIDTH
+    concession_frac = 1.0 - g_t   # ∈ [0, 1−m]; 0=most selfish, grows as g_t falls
+
+    zopa_low_est  = max(pub_min, reservation - ZOPA_WIDTH)   # ≈ seller_min
+    zopa_high_est = min(pub_max, reservation + ZOPA_WIDTH)   # ≈ buyer_max
+
+    if role == "buyer":
+        # Opens at zopa_low_est (most selfish), concedes toward reservation
+        target_price = zopa_low_est + concession_frac * ZOPA_WIDTH
+        target_price = max(zopa_low_est, min(target_price, reservation))
+    else:
+        # Opens at zopa_high_est (most selfish), concedes toward reservation
+        target_price = zopa_high_est - concession_frac * ZOPA_WIDTH
+        target_price = max(reservation, min(target_price, zopa_high_est))
+
+    # ------------------------------------------------------------------ #
+    # 6. Bid randomisation window (paper Eq. 2)                           #
+    # ------------------------------------------------------------------ #
+    # Paper: window = [g(t)−(3t+1)ε, g(t)+(3t+1)ε] in utility space.
+    # ε is the tolerance (granularity of bid space), typically 0.001–0.05.
+    # We convert the utility window to a price window.
+    epsilon: float = params.get("epsilon", 0.02)   # utility-space tolerance
+    half_window = (3.0 * t + 1.0) * epsilon * ZOPA_WIDTH   # price-space half-width
+
+    if role == "buyer":
+        # Buyer wants LOW prices; window stays within [zopa_low_est, reservation]
+        lo = max(zopa_low_est, target_price - half_window)
+        hi = min(reservation,  target_price + half_window)
+    else:
+        # Seller wants HIGH prices; window stays within [reservation, zopa_high_est]
+        lo = max(reservation,   target_price - half_window)
+        hi = min(zopa_high_est, target_price + half_window)
+
+    if lo > hi:
+        lo, hi = hi, lo
+    bid_price = lo if lo == hi else random.uniform(lo, hi)
+    bid_price = round(bid_price, 2)
+
+    # Paper §3.2.1: "If ChargingBoul selects a bid with lower utility than one
+    # it has already *received and rejected*, it re-proposes that rejected bid."
+    # i.e. if our new bid is worse for us than the best offer we've received,
+    # re-propose that received offer instead (never undersell ourselves).
+    best_recv_util = mem.get("best_received_utility", -float("inf"))
+    if best_recv_util > -float("inf") and "best_received_price" in mem:
+        recv_price = mem["best_received_price"]
+        # Check if the received price is better for us than our current bid
+        if role == "buyer" and recv_price < bid_price:
+            # Received offer is lower (better for buyer) than what we'd propose
+            bid_price = recv_price
+        elif role == "seller" and recv_price > bid_price:
+            # Received offer is higher (better for seller) than what we'd propose
+            bid_price = recv_price
+
+    # Final safety clamp — ensure bid never crosses own reservation
+    if role == "buyer":
+        bid_price = max(zopa_low_est, min(bid_price, reservation))
+    else:
+        bid_price = max(reservation, min(bid_price, zopa_high_est))
+
+    # ------------------------------------------------------------------ #
+    # 7. Acceptance rule                                                   #
+    # ------------------------------------------------------------------ #
+    if state.last_offer_price is not None:
+        opp_price = state.last_offer_price
+        # Check the offer is within our reservation (acceptable)
+        is_acceptable = (
+            opp_price <= reservation if role == "buyer" else opp_price >= reservation
+        )
+        # Check it is at least as good as our generated bid
+        is_good_enough = (
+            opp_price <= bid_price if role == "buyer" else opp_price >= bid_price
+        )
+        if is_acceptable and is_good_enough:
+            return PriceAction(type="ACCEPT", price=None)
+
+    return PriceAction(type="OFFER", price=bid_price)
+
+
+# ---------------------------------------------------------------------------
+
+
 def strategy_naive_boulware(state: PriceState, params: Dict[str, Any]) -> PriceAction:
     """
     Naive Boulware strategy - concedes in the WRONG direction with hardline-then-sudden-drop curve.
@@ -715,6 +1161,46 @@ STRATEGY_REGISTRY: Dict[str, StrategySpec] = {
         {"step_size": 50.0}
     ),
 
+    # ChargingBoul — Adaptive opponent-modelling (Shymanski 2025, arXiv:2512.06595)
+    "charging_boul": StrategySpec(
+        "charging_boul",
+        "ChargingBoul: adaptive Boulware with UBI/AUI opponent modelling (m=0.5, E=0.4)",
+        strategy_charging_boul,
+        {"m_default": 0.5, "E_default": 0.4, "epsilon": 0.02}
+    ),
+    "charging_boul_aggressive": StrategySpec(
+        "charging_boul_aggressive",
+        "ChargingBoul with higher utility floor (m=0.6, E=0.2) — strong Boulware, less willing to concede",
+        strategy_charging_boul,
+        {"m_default": 0.6, "E_default": 0.2, "epsilon": 0.02}
+    ),
+    "charging_boul_patient": StrategySpec(
+        "charging_boul_patient",
+        "ChargingBoul with faster concession rate (E=0.8) — more linear, concedes steadily",
+        strategy_charging_boul,
+        {"m_default": 0.5, "E_default": 0.8, "epsilon": 0.02}
+    ),
+
+    # Fair / Equitable
+    "fair": StrategySpec(
+        "fair",
+        "Targets equal ZOPA split (midpoint), converges toward fair price over time",
+        strategy_fair,
+        {"convergence_rate": 0.8}
+    ),
+    "fair_fast": StrategySpec(
+        "fair_fast",
+        "Opens directly at ZOPA midpoint and holds (convergence_rate=1.0)",
+        strategy_fair,
+        {"convergence_rate": 1.0}
+    ),
+    "fair_slow": StrategySpec(
+        "fair_slow",
+        "Starts at ZOPA boundary and slowly converges to midpoint (convergence_rate=0.4)",
+        strategy_fair,
+        {"convergence_rate": 0.4}
+    ),
+
     # Bad Strategies
     "naive_concession": StrategySpec(
         "naive_concession",
@@ -757,6 +1243,12 @@ def get_benchmark_strategies() -> List[str]:
 REACTIVE_STRATEGIES: set = {
     "tit_for_tat",
     "split_difference",
+    "charging_boul",
+    "charging_boul_aggressive",
+    "charging_boul_patient",
+    "fair",
+    "fair_fast",
+    "fair_slow",
     "micro_fine",
     "micro_moderate",
     "micro_coarse",
