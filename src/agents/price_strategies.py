@@ -240,36 +240,56 @@ def strategy_linear(state: PriceState, params: Dict[str, Any]) -> PriceAction:
 
 def strategy_split_difference(state: PriceState, params: Dict[str, Any]) -> PriceAction:
     """
-    Split difference between last offer and own previous offer (or reservation).
-    If initial_margin is None, starts at opponent's reservation (ZOPA boundary).
+    Split difference between last offer and own previous offer (or ZOPA boundary).
+    Starts at the opponent's estimated reservation price (ZOPA boundary), then on each
+    subsequent turn proposes the midpoint between own last offer and the opponent's last offer.
+
+    The ZOPA boundary is estimated as reservation +/- DEFAULT_ZOPA_WIDTH when not explicitly
+    provided via params (zopa_low / zopa_high / initial_margin).
     """
     role = state.role
     reservation = state.effective_reservation_price
     pub_min, pub_max = state.public_price_range if state.public_price_range else (0.0, 2000.0)
-    
-    # Get ZOPA bounds - default to public bounds if not provided
-    zopa_low = params.get("zopa_low", pub_min)
-    zopa_high = params.get("zopa_high", pub_max)
-    
-    if state.last_offer_price is None:
-        margin = params.get("initial_margin", None)
-        if margin is not None:
-            target = reservation - margin if role == "buyer" else reservation + margin
-        else:
-            # Start at opponent's reservation (ZOPA boundary)
-            target = zopa_low if role == "buyer" else zopa_high
-        return PriceAction(type="OFFER", price=round(target, 2))
-        
-    opp_price = state.last_offer_price
-    
-    my_offers = [p for r, p in state.offer_history if r == role]
-    if not my_offers:
-        my_anchor = reservation
+
+    # Estimate the selfish starting anchor: opponent's reservation = own reservation +/- ZOPA width.
+    # This mirrors how every other strategy initialises (e.g. boulware, hardliner).
+    DEFAULT_ZOPA_WIDTH = 500.0
+    margin = params.get("initial_margin", DEFAULT_ZOPA_WIDTH)
+    if role == "buyer":
+        # Buyer starts LOW: own reservation minus ZOPA width (≈ seller's reservation)
+        selfish_start = max(pub_min, reservation - margin)
     else:
-        my_anchor = my_offers[-1]
-        
+        # Seller starts HIGH: own reservation plus ZOPA width (≈ buyer's reservation)
+        selfish_start = min(pub_max, reservation + margin)
+
+    # --- First offer (no prior offers at all, including when seller goes second) ---
+    # Use selfish_start as the anchor so the midpoint mechanism begins from the right place.
+    my_offers = [p for r, p in state.offer_history if r == role]
+
+    if not my_offers:
+        # No offer from us yet. If the opponent has already made an offer, split the
+        # difference between our selfish start and their offer; otherwise just open
+        # at the selfish start.
+        if state.last_offer_price is not None:
+            opp_price = state.last_offer_price
+            midpoint = (selfish_start + opp_price) / 2.0
+            if role == "buyer":
+                target = min(midpoint, reservation)
+                if opp_price <= target:
+                    return PriceAction(type="ACCEPT", price=None)
+            else:
+                target = max(midpoint, reservation)
+                if opp_price >= target:
+                    return PriceAction(type="ACCEPT", price=None)
+            return PriceAction(type="OFFER", price=round(target, 2))
+        else:
+            return PriceAction(type="OFFER", price=round(selfish_start, 2))
+
+    # --- Subsequent offers: split between own last offer and opponent's last offer ---
+    opp_price = state.last_offer_price  # always set here (we've already offered at least once)
+    my_anchor = my_offers[-1]
     midpoint = (my_anchor + opp_price) / 2.0
-    
+
     if role == "buyer":
         target = min(midpoint, reservation)
         if opp_price <= target:
@@ -278,7 +298,7 @@ def strategy_split_difference(state: PriceState, params: Dict[str, Any]) -> Pric
         target = max(midpoint, reservation)
         if opp_price >= target:
             return PriceAction(type="ACCEPT", price=None)
-             
+
     return PriceAction(type="OFFER", price=round(target, 2))
 
 
