@@ -234,6 +234,16 @@ def parse_args():
     parser.add_argument("--sep_exclude_failures", type=str, default="true",
                         help="Exclude rho=-1 rows from separation loss")
 
+    # Resume
+    parser.add_argument("--resume_from", type=str, default=None,
+                        help="Path to a checkpoint directory (or 'final' sub-dir) to resume from. "
+                             "Loads adapter_state.pt and restores the global step counter so that "
+                             "--max_steps is treated as the *total* target step count.")
+    parser.add_argument("--resume_step", type=int, default=None,
+                        help="Override the step number to resume from. If omitted the step is read "
+                             "from training_log.json in --output_dir (last checkpoint or final entry). "
+                             "Only used when --resume_from is set.")
+
     # Eval / Saving
     parser.add_argument("--save_every", type=int, default=1000)
     parser.add_argument("--eval_every", type=int, default=1000)
@@ -518,6 +528,41 @@ def load_training_log(output_dir: str) -> Dict[str, Any]:
     return {"checkpoints": [], "final": None}
 
 
+def infer_resume_step(output_dir: str, training_log: Dict[str, Any]) -> int:
+    """Determine the step to resume from by inspecting training_log.
+
+    Priority:
+    1. ``final`` entry (training completed at least once).
+    2. Last checkpoint entry.
+    3. 0 (no prior history).
+    """
+    if training_log.get("final") and training_log["final"].get("step") is not None:
+        return int(training_log["final"]["step"])
+    if training_log.get("checkpoints"):
+        return int(training_log["checkpoints"][-1]["step"])
+    return 0
+
+
+def load_adapter_weights(model: nn.Module, adapter_dir: str) -> None:
+    """Load adapter_state.pt from *adapter_dir* into *model* (strict=False)."""
+    state_path = os.path.join(adapter_dir, "adapter_state.pt")
+    if not os.path.exists(state_path):
+        raise FileNotFoundError(
+            f"No adapter_state.pt found in {adapter_dir!r}. "
+            "Check --resume_from points to a valid checkpoint directory."
+        )
+    state_dict = torch.load(state_path, map_location="cpu")
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    logger.info(
+        "Loaded adapter weights from %s  (missing=%d, unexpected=%d)",
+        state_path, len(missing), len(unexpected),
+    )
+    if missing:
+        logger.warning("Missing keys (not loaded): %s", missing[:10])
+    if unexpected:
+        logger.warning("Unexpected keys (ignored): %s", unexpected[:10])
+
+
 def save_training_log(output_dir: str, log: Dict[str, Any]):
     """Persist training_log.json atomically."""
     os.makedirs(output_dir, exist_ok=True)
@@ -671,11 +716,45 @@ def train():
     os.makedirs(args.output_dir, exist_ok=True)
     training_log = load_training_log(args.output_dir)
 
+    # --- resume ------------------------------------------------------------
+    start_step = 0
+    if args.resume_from is not None:
+        logger.info("Resuming from checkpoint: %s", args.resume_from)
+        load_adapter_weights(model, args.resume_from)
+
+        # Determine which step we are resuming from
+        if args.resume_step is not None:
+            start_step = args.resume_step
+        else:
+            start_step = infer_resume_step(args.output_dir, training_log)
+
+        if start_step >= args.max_steps:
+            raise ValueError(
+                f"resume_step ({start_step}) >= max_steps ({args.max_steps}). "
+                "Increase --max_steps to a value greater than the resume step."
+            )
+
+        # Fast-forward the LR scheduler to match the resumed step so the
+        # learning rate curve is continuous rather than restarting from 0.
+        logger.info(
+            "Fast-forwarding scheduler by %d steps (resume_step=%d, max_steps=%d).",
+            start_step, start_step, args.max_steps,
+        )
+        for _ in range(start_step):
+            scheduler.step()
+
+        logger.info("Resuming training from step %d → target %d steps.", start_step, args.max_steps)
+
+        # Clear the stale "final" entry so the new run appends cleanly.
+        if training_log.get("final") is not None:
+            training_log["resumed_from"] = training_log.pop("final")
+            save_training_log(args.output_dir, training_log)
+
     # --- training loop -----------------------------------------------------
     logger.info("Starting Training...")
-    global_step = 0
+    global_step = start_step
     model.train()
-    progress_bar = tqdm(total=args.max_steps, desc="Training")
+    progress_bar = tqdm(total=args.max_steps, desc="Training", initial=start_step)
     epoch = 0
 
     # Rolling window of recent train losses for train/eval gap tracking
