@@ -261,10 +261,13 @@ async def run_episode(
             # Janus's turn
             if use_base_model:
                 # Use OllamaAgent's built-in prompt builder
+                # Pass opponent_reservation so seller anchors relative to ZOPA top
+                janus_opponent_reservation = seller_min if janus_role == "buyer" else buyer_max
                 prompt = janus_agent.build_prompt(
                     turn=turn,
                     last_offer=last_offer,
-                    history=history
+                    history=history,
+                    opponent_reservation=janus_opponent_reservation
                 )
                 if verbose:
                     print(f"\n  === PROMPT (turn {turn}) ===")
@@ -343,10 +346,13 @@ async def run_episode(
             # Opponent's turn
             if opponent_is_base_model:
                 # Base model opponent uses OllamaAgent's generate_response
+                # Pass opponent_reservation so seller anchors relative to ZOPA top
+                opp_opponent_reservation = buyer_max if opponent_role == "seller" else seller_min
                 prompt = opponent.build_prompt(
                     turn=turn,
                     last_offer=last_offer,
-                    history=history
+                    history=history,
+                    opponent_reservation=opp_opponent_reservation
                 )
                 response = await opponent.generate_response(input_text_role="user", input_text=prompt)
                 action = domain.parse_agent_action(opponent_agent_num, response)
@@ -716,6 +722,10 @@ async def main():
         "--include_base_comparison", action="store_true",
         help="Include Janus vs Base Model comparison test (only when testing Janus)"
     )
+    parser.add_argument(
+        "--only_base_comparison", action="store_true",
+        help="Run ONLY Janus vs Base Model comparison (skip all deterministic strategies)"
+    )
     args = parser.parse_args()
     
     # Handle janus_rho override
@@ -730,7 +740,13 @@ async def main():
     janus_adapter_path = args.janus_adapter if args.janus_adapter else JANUS_ADAPTER_PATH
     
     # Get strategies to test
-    strategies = args.strategies if args.strategies else get_benchmark_strategies()
+    if args.only_base_comparison:
+        strategies = []  # Skip all deterministic strategies
+        args.include_base_comparison = True  # Force enable base comparison
+    elif args.strategies:
+        strategies = args.strategies
+    else:
+        strategies = get_benchmark_strategies()
     
     if args.use_base_model:
         print(f"{Fore.MAGENTA}{'='*80}")

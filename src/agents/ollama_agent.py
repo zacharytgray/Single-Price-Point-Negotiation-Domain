@@ -54,12 +54,18 @@ class OllamaAgent:
             )
 
     def build_prompt(self, turn: int,
-                     last_offer: Optional[float], history: List[Tuple[str, float]]) -> str:
+                     last_offer: Optional[float], history: List[Tuple[str, float]],
+                     opponent_reservation: Optional[float] = None) -> str:
         """Build negotiation prompt for base model.
 
         Key design: frame the negotiation space so the model understands
         WHERE in the price range it should be operating, not just the
         reservation boundary.  Buyer wants price LOW, seller wants price HIGH.
+
+        Args:
+            opponent_reservation: The opponent's reservation price (buyer_max for seller,
+                                  seller_min for buyer). Used to compute ZOPA-relative
+                                  opening anchors so the seller doesn't anchor too low.
         """
         turns_remaining = self.max_turns - turn + 1
 
@@ -104,9 +110,18 @@ class OllamaAgent:
                 "You lose money on every dollar below the maximum the buyer would pay, "
                 "so you want to sell as far ABOVE your minimum as you can."
             )
-            # Seller: start at 130-150% of reservation (aggressive but not extreme)
-            opening_low = round(self.reservation_price * 1.3, 2)
-            opening_high = round(self.reservation_price * 1.5, 2)
+            # Seller should anchor near the TOP of the ZOPA (near buyer_max), not
+            # relative to their own floor — multiplying seller_min by 1.3x lands
+            # well below the midpoint when the ZOPA is wide.
+            if opponent_reservation is not None:
+                # opponent_reservation is buyer_max; anchor at 80-95% of ZOPA
+                zopa = opponent_reservation - self.reservation_price
+                opening_low  = round(self.reservation_price + zopa * 0.80, 2)
+                opening_high = round(self.reservation_price + zopa * 0.95, 2)
+            else:
+                # Fallback: 130-150% of reservation (legacy behaviour)
+                opening_low  = round(self.reservation_price * 1.3, 2)
+                opening_high = round(self.reservation_price * 1.5, 2)
             strategy_block = (
                 "STRATEGY:\n"
                 f"- Open with a HIGH offer (around ${opening_low:.2f}–${opening_high:.2f}) to anchor the negotiation.\n"

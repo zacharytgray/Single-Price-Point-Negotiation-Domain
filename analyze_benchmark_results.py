@@ -14,6 +14,7 @@ import argparse
 import os
 import sys
 import glob
+import re
 from datetime import datetime
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
@@ -115,7 +116,9 @@ def create_strategy_violin_plots(
     df_buyer: pd.DataFrame,
     output_dir: str,
     prefix: str = "",
-    model_name: str = "Janus"
+    model_name: str = "Janus",
+    buyer_rho: Optional[float] = None,
+    seller_rho: Optional[float] = None
 ):
     """
     Create violin plots for each strategy comparing Janus vs opponent utilities.
@@ -198,7 +201,17 @@ def create_strategy_violin_plots(
                     ax.text(i, mean_val + 0.05, f'μ={mean_val:.2%}', 
                            ha='center', fontsize=9, fontweight='bold')
         
-        plt.suptitle(f'Utility Distribution: {model_name} vs {strategy}', fontsize=13, fontweight='bold', y=1.02)
+        # Build dynamic title with rho values if available for Janus
+        if model_name == "Janus" and (buyer_rho is not None or seller_rho is not None):
+            rho_parts = []
+            if buyer_rho is not None:
+                rho_parts.append(f"Bρ={buyer_rho:.1f}")
+            if seller_rho is not None:
+                rho_parts.append(f"Sρ={seller_rho:.1f}")
+            rho_str = ", ".join(rho_parts)
+            plt.suptitle(f'Utility Distribution: {model_name} ({rho_str}) vs {strategy}', fontsize=13, fontweight='bold', y=1.02)
+        else:
+            plt.suptitle(f'Utility Distribution: {model_name} vs {strategy}', fontsize=13, fontweight='bold', y=1.02)
         plt.tight_layout()
         
         # Save plot
@@ -297,11 +310,117 @@ def create_janus_vs_base_comparison_plot(
     print(f"    Saved: {filepath}")
 
 
+def create_win_loss_plot(
+    summaries: List[StrategySummary],
+    output_dir: str,
+    prefix: str = "",
+    model_name: str = "Janus",
+    buyer_rho: Optional[float] = None,
+    seller_rho: Optional[float] = None
+):
+    """
+    Create a standalone stacked horizontal bar chart showing win/tie/loss
+    distribution for each strategy, with Janus utility mean annotated.
+    """
+    # Exclude strategies with zero agreements (nothing meaningful to show)
+    valid = [s for s in summaries if s.agreements > 0]
+    if not valid:
+        return
+
+    strategies = [s.strategy.replace('base_model_opponent', 'vs Base Model') for s in valid]
+    janus_wins  = [s.janus_wins    for s in valid]
+    ties        = [s.ties          for s in valid]
+    opp_wins    = [s.opponent_wins for s in valid]
+    agreements  = [s.agreements    for s in valid]
+    totals      = [s.total_episodes for s in valid]
+    janus_norms = [s.avg_janus_norm for s in valid]
+
+    # Disagreements = episodes with no agreement
+    disagreements = [t - a for t, a in zip(totals, agreements)]
+
+    # Convert to percentages (of total episodes, not just agreements)
+    janus_pct = [w / t * 100 for w, t in zip(janus_wins, totals)]
+    tie_pct   = [w / t * 100 for w, t in zip(ties,       totals)]
+    opp_pct   = [w / t * 100 for w, t in zip(opp_wins,   totals)]
+    disag_pct = [d / t * 100 for d, t in zip(disagreements, totals)]
+
+    n = len(valid)
+    fig_height = max(4, n * 0.55 + 1.5)
+    fig, ax = plt.subplots(figsize=(11, fig_height))
+
+    y = range(n)
+    bar_h = 0.55
+
+    bars_j = ax.barh(y, janus_pct, height=bar_h, color='#2ecc71', label=f'{model_name} Wins')
+    bars_t = ax.barh(y, tie_pct,   height=bar_h, left=janus_pct,  color='#f39c12', label='Ties')
+    bars_o = ax.barh(y, opp_pct,   height=bar_h,
+                     left=[j + t for j, t in zip(janus_pct, tie_pct)],
+                     color='#e74c3c', label='Opponent Wins')
+    bars_d = ax.barh(y, disag_pct, height=bar_h,
+                     left=[j + t + o for j, t, o in zip(janus_pct, tie_pct, opp_pct)],
+                     color='#95a5a6', label='Disagreements')
+
+    # Annotate each segment with its count (skip tiny segments)
+    for i in range(n):
+        if janus_pct[i] > 5:
+            ax.text(janus_pct[i] / 2, i, str(janus_wins[i]),
+                    va='center', ha='center', fontsize=8, fontweight='bold', color='white')
+        if tie_pct[i] > 5:
+            ax.text(janus_pct[i] + tie_pct[i] / 2, i, str(ties[i]),
+                    va='center', ha='center', fontsize=8, fontweight='bold', color='white')
+        if opp_pct[i] > 5:
+            ax.text(janus_pct[i] + tie_pct[i] + opp_pct[i] / 2, i, str(opp_wins[i]),
+                    va='center', ha='center', fontsize=8, fontweight='bold', color='white')
+        # Disagreement annotation (gray segment on the far right)
+        if disag_pct[i] > 5:
+            ax.text(janus_pct[i] + tie_pct[i] + opp_pct[i] + disag_pct[i] / 2, i, str(disagreements[i]),
+                    va='center', ha='center', fontsize=8, fontweight='bold', color='white')
+        # Janus mean utility label on the right
+        ax.text(101, i, f'μ={janus_norms[i]:.0%}',
+                va='center', ha='left', fontsize=8, color='black')
+
+    ax.set_yticks(list(y))
+    ax.set_yticklabels(strategies, fontsize=9)
+    ax.set_xlabel('% of Total Episodes (disagreements in gray)', fontsize=10)
+    ax.set_xlim(0, 100)
+    ax.axvline(x=50, color='gray', linestyle='--', alpha=0.4, linewidth=1)
+    ax.invert_yaxis()  # top strategy first
+    ax.legend(loc='lower right', fontsize=9)
+
+    # Secondary x-axis label for the μ annotations
+    ax.text(101, -0.8, f'{model_name}\nUtil μ', va='top', ha='left', fontsize=8,
+            color='black', style='italic')
+
+    # Build dynamic title with rho values if available for Janus
+    if model_name == "Janus" and (buyer_rho is not None or seller_rho is not None):
+        rho_parts = []
+        if buyer_rho is not None:
+            rho_parts.append(f"Bρ={buyer_rho:.1f}")
+        if seller_rho is not None:
+            rho_parts.append(f"Sρ={seller_rho:.1f}")
+        rho_str = ", ".join(rho_parts)
+        plt.suptitle(f'{model_name} ({rho_str}) Win / Tie / Loss by Opponent Strategy',
+                     fontsize=13, fontweight='bold')
+    else:
+        plt.suptitle(f'{model_name} Win / Tie / Loss by Opponent Strategy',
+                     fontsize=13, fontweight='bold')
+    plt.tight_layout()
+
+    filename = f"{prefix}win_loss_distribution.png" if prefix else "win_loss_distribution.png"
+    filepath = os.path.join(output_dir, filename)
+    plt.savefig(filepath, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    print(f"\n{Fore.GREEN}Win/loss plot saved: {filepath}{Fore.RESET}")
+
+
 def create_overall_summary_plot(
     summaries: List[StrategySummary],
     output_dir: str,
     prefix: str = "",
-    model_name: str = "Janus"
+    model_name: str = "Janus",
+    buyer_rho: Optional[float] = None,
+    seller_rho: Optional[float] = None
 ):
     """Create an overall summary plot comparing all strategies."""
     
@@ -358,7 +477,17 @@ def create_overall_summary_plot(
     ax.set_xticks(x_pos)
     ax.set_xticklabels(strategies, rotation=45, ha='right', fontsize=8)
     
-    plt.suptitle(f'{model_name} Benchmark Summary - All Strategies', fontsize=14, fontweight='bold')
+    # Build dynamic title with rho values if available for Janus
+    if model_name == "Janus" and (buyer_rho is not None or seller_rho is not None):
+        rho_parts = []
+        if buyer_rho is not None:
+            rho_parts.append(f"Bρ={buyer_rho:.1f}")
+        if seller_rho is not None:
+            rho_parts.append(f"Sρ={seller_rho:.1f}")
+        rho_str = ", ".join(rho_parts)
+        plt.suptitle(f'{model_name} ({rho_str}) Benchmark Summary - All Strategies', fontsize=14, fontweight='bold')
+    else:
+        plt.suptitle(f'{model_name} Benchmark Summary - All Strategies', fontsize=14, fontweight='bold')
     plt.tight_layout()
     
     filename = f"{prefix}overall_summary.png" if prefix else "overall_summary.png"
@@ -481,8 +610,8 @@ def main():
         help="Path to benchmark CSV file (or glob pattern)"
     )
     parser.add_argument(
-        "--output_dir", type=str, default="benchmark_analysis",
-        help="Directory to save plots (default: benchmark_analysis)"
+        "--output_dir", type=str, default=None,
+        help="Directory to save plots (default: benchmark_analysis subfolder in CSV directory)"
     )
     parser.add_argument(
         "--prefix", type=str, default="",
@@ -505,6 +634,11 @@ def main():
         print(f"File not found: {csv_path}")
         return
     
+    # Set default output directory to benchmark_analysis subfolder in CSV directory
+    if args.output_dir is None:
+        csv_dir = os.path.dirname(os.path.abspath(csv_path))
+        args.output_dir = os.path.join(csv_dir, "benchmark_analysis")
+    
     # Load data
     print(f"\nLoading results from: {csv_path}")
     df = load_results(csv_path)
@@ -513,14 +647,25 @@ def main():
         print("No data found!")
         return
     
-    # Detect model name from CSV filename
-    csv_basename = os.path.basename(csv_path).lower()
-    if 'qwen' in csv_basename:
+    # Detect model name and rho values from CSV filename
+    csv_basename = os.path.basename(csv_path)
+    csv_basename_lower = csv_basename.lower()
+    if 'qwen' in csv_basename_lower:
         model_name = "Qwen"
-    elif 'base' in csv_basename:
+    elif 'base' in csv_basename_lower:
         model_name = "Base Model"
     else:
         model_name = "Janus"
+    
+    # Extract buyer/seller rho from filename (e.g., B0.8_S0.2)
+    buyer_rho: Optional[float] = None
+    seller_rho: Optional[float] = None
+    rho_match = re.search(r'B(\d+\.?\d*)_S(\d+\.?\d*)', csv_basename)
+    if rho_match:
+        buyer_rho = float(rho_match.group(1))
+        seller_rho = float(rho_match.group(2))
+        print(f"Detected rho values: Buyer ρ={buyer_rho}, Seller ρ={seller_rho}")
+    
     print(f"Detected model: {model_name}")
     
     # Create output directory
@@ -562,11 +707,15 @@ def main():
     
     # Create overall summary plot
     print("\nCreating overall summary plot...")
-    create_overall_summary_plot(summaries, args.output_dir, args.prefix, model_name)
+    create_overall_summary_plot(summaries, args.output_dir, args.prefix, model_name, buyer_rho, seller_rho)
+
+    # Create win/tie/loss distribution plot
+    print("\nCreating win/loss distribution plot...")
+    create_win_loss_plot(summaries, args.output_dir, args.prefix, model_name, buyer_rho, seller_rho)
     
     # Create violin plots for each strategy
     print("\nCreating strategy violin plots...")
-    create_strategy_violin_plots(df_seller, df_buyer, args.output_dir, args.prefix, model_name)
+    create_strategy_violin_plots(df_seller, df_buyer, args.output_dir, args.prefix, model_name, buyer_rho, seller_rho)
     
     # Print summary table
     print_summary_table(summaries)

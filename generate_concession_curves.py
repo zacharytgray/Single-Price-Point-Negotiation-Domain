@@ -320,8 +320,8 @@ def main():
     parser.add_argument(
         '--output_dir',
         type=str,
-        default='concession_plots',
-        help='Directory to save plots (default: concession_plots)'
+        default=None,
+        help='Directory to save plots (default: concession_curves subfolder in CSV directory)'
     )
     parser.add_argument(
         '--prefix',
@@ -352,6 +352,11 @@ def main():
     # Use the most recent file if multiple match
     csv_path = sorted(csv_files)[-1]
     print(f"{Fore.CYAN}Using: {csv_path}{Fore.RESET}")
+    
+    # Set default output directory to concession_curves subfolder in CSV directory
+    if args.output_dir is None:
+        csv_dir = os.path.dirname(os.path.abspath(csv_path))
+        args.output_dir = os.path.join(csv_dir, "concession_curves")
     
     # Load data
     df = load_results(csv_path)
